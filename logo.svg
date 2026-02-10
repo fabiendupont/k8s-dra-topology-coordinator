@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Gradient for the chip/node background -->
+    <linearGradient id="chipGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#16213e;stop-opacity:1" />
+    </linearGradient>
+    <!-- Partition colors -->
+    <linearGradient id="partA" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#326ce5;stop-opacity:0.9" />
+      <stop offset="100%" style="stop-color:#2856b8;stop-opacity:0.9" />
+    </linearGradient>
+    <linearGradient id="partB" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4a90d9;stop-opacity:0.85" />
+      <stop offset="100%" style="stop-color:#3a7bc8;stop-opacity:0.85" />
+    </linearGradient>
+    <linearGradient id="partC" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6ba3e8;stop-opacity:0.8" />
+      <stop offset="100%" style="stop-color:#5b93d8;stop-opacity:0.8" />
+    </linearGradient>
+    <linearGradient id="partD" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#8bb8f0;stop-opacity:0.75" />
+      <stop offset="100%" style="stop-color:#7ba8e0;stop-opacity:0.75" />
+    </linearGradient>
+    <!-- Coordinator hub glow -->
+    <radialGradient id="hubGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" style="stop-color:#ffffff;stop-opacity:0.3" />
+      <stop offset="100%" style="stop-color:#ffffff;stop-opacity:0" />
+    </radialGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="248" fill="url(#chipGrad)" stroke="#326ce5" stroke-width="3"/>
+
+  <!-- PCIe/interconnect lines radiating from center (subtle) -->
+  <g stroke="#326ce5" stroke-width="1" opacity="0.3">
+    <line x1="256" y1="80" x2="256" y2="432"/>
+    <line x1="80" y1="256" x2="432" y2="256"/>
+    <line x1="132" y1="132" x2="380" y2="380"/>
+    <line x1="380" y1="132" x2="132" y2="380"/>
+  </g>
+
+  <!-- NUMA Node 0 (top-left quadrant) - Quarter partition -->
+  <g transform="translate(96, 96)">
+    <!-- Partition background -->
+    <rect x="0" y="0" width="148" height="148" rx="12" fill="url(#partA)" stroke="#4a90d9" stroke-width="1.5"/>
+    <!-- Device dots (GPUs) -->
+    <circle cx="37" cy="37" r="14" fill="#ffffff" opacity="0.9"/>
+    <circle cx="111" cy="37" r="14" fill="#ffffff" opacity="0.9"/>
+    <!-- Device dots (NICs) -->
+    <circle cx="37" cy="111" r="10" fill="#ffffff" opacity="0.6"/>
+    <circle cx="111" cy="111" r="10" fill="#ffffff" opacity="0.6"/>
+    <!-- Alignment lines between devices -->
+    <line x1="37" y1="51" x2="37" y2="101" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+    <line x1="111" y1="51" x2="111" y2="101" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+    <line x1="51" y1="37" x2="97" y2="37" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+  </g>
+
+  <!-- NUMA Node 1 (top-right quadrant) -->
+  <g transform="translate(268, 96)">
+    <rect x="0" y="0" width="148" height="148" rx="12" fill="url(#partB)" stroke="#4a90d9" stroke-width="1.5"/>
+    <circle cx="37" cy="37" r="14" fill="#ffffff" opacity="0.9"/>
+    <circle cx="111" cy="37" r="14" fill="#ffffff" opacity="0.9"/>
+    <circle cx="37" cy="111" r="10" fill="#ffffff" opacity="0.6"/>
+    <circle cx="111" cy="111" r="10" fill="#ffffff" opacity="0.6"/>
+    <line x1="37" y1="51" x2="37" y2="101" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+    <line x1="111" y1="51" x2="111" y2="101" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+    <line x1="51" y1="37" x2="97" y2="37" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+  </g>
+
+  <!-- NUMA Node 2 (bottom-left quadrant) -->
+  <g transform="translate(96, 268)">
+    <rect x="0" y="0" width="148" height="148" rx="12" fill="url(#partC)" stroke="#4a90d9" stroke-width="1.5"/>
+    <circle cx="37" cy="37" r="14" fill="#ffffff" opacity="0.9"/>
+    <circle cx="111" cy="37" r="14" fill="#ffffff" opacity="0.9"/>
+    <circle cx="37" cy="111" r="10" fill="#ffffff" opacity="0.6"/>
+    <circle cx="111" cy="111" r="10" fill="#ffffff" opacity="0.6"/>
+    <line x1="37" y1="51" x2="37" y2="101" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+    <line x1="111" y1="51" x2="111" y2="101" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+    <line x1="51" y1="37" x2="97" y2="37" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+  </g>
+
+  <!-- NUMA Node 3 (bottom-right quadrant) -->
+  <g transform="translate(268, 268)">
+    <rect x="0" y="0" width="148" height="148" rx="12" fill="url(#partD)" stroke="#4a90d9" stroke-width="1.5"/>
+    <circle cx="37" cy="37" r="14" fill="#ffffff" opacity="0.9"/>
+    <circle cx="111" cy="37" r="14" fill="#ffffff" opacity="0.9"/>
+    <circle cx="37" cy="111" r="10" fill="#ffffff" opacity="0.6"/>
+    <circle cx="111" cy="111" r="10" fill="#ffffff" opacity="0.6"/>
+    <line x1="37" y1="51" x2="37" y2="101" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+    <line x1="111" y1="51" x2="111" y2="101" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+    <line x1="51" y1="37" x2="97" y2="37" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+  </g>
+
+  <!-- Central coordinator hub -->
+  <circle cx="256" cy="256" r="40" fill="url(#hubGlow)"/>
+  <circle cx="256" cy="256" r="28" fill="#326ce5" stroke="#ffffff" stroke-width="2.5"/>
+  <!-- Kubernetes wheel icon (simplified) -->
+  <g transform="translate(256, 256)" stroke="#ffffff" stroke-width="2" fill="none">
+    <circle cx="0" cy="0" r="8"/>
+    <line x1="0" y1="-8" x2="0" y2="-18"/>
+    <line x1="7" y1="4" x2="15.6" y2="9"/>
+    <line x1="-7" y1="4" x2="-15.6" y2="9"/>
+    <line x1="0" y1="8" x2="0" y2="18"/>
+    <line x1="-7" y1="-4" x2="-15.6" y2="-9"/>
+    <line x1="7" y1="-4" x2="15.6" y2="-9"/>
+    <!-- Spokes end dots -->
+    <circle cx="0" cy="-19" r="3" fill="#ffffff"/>
+    <circle cx="16.5" cy="9.5" r="3" fill="#ffffff"/>
+    <circle cx="-16.5" cy="9.5" r="3" fill="#ffffff"/>
+    <circle cx="0" cy="19" r="3" fill="#ffffff"/>
+    <circle cx="-16.5" cy="-9.5" r="3" fill="#ffffff"/>
+    <circle cx="16.5" cy="-9.5" r="3" fill="#ffffff"/>
+  </g>
+
+  <!-- Partition boundary highlight lines (showing the partitioning) -->
+  <line x1="256" y1="88" x2="256" y2="424" stroke="#ffffff" stroke-width="2" opacity="0.15"/>
+  <line x1="88" y1="256" x2="424" y2="256" stroke="#ffffff" stroke-width="2" opacity="0.15"/>
+</svg>

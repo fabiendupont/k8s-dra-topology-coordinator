@@ -1,0 +1,10 @@
+Node Partition Topology Coordinator deployed.
+
+Controller: {{ include "nodepartition.fullname" . }}-controller
+Driver name: {{ .Values.driverName }}
+
+The controller watches ResourceSlices from all DRA drivers and publishes
+aligned partition ResourceSlices for topology-aware scheduling.
+
+To check the status:
+  kubectl get deployment {{ include "nodepartition.fullname" . }}-controller -n {{ .Release.Namespace }}

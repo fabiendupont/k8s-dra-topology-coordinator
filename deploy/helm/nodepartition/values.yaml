@@ -1,0 +1,51 @@
+nameOverride: ""
+fullnameOverride: ""
+commonLabels: {}
+commonAnnotations: {}
+
+driverName: "nodepartition.dra.k8s.io"
+
+controller:
+  replicaCount: 1
+  image:
+    repository: ghcr.io/fabiendupont/nodepartition-controller
+    pullPolicy: IfNotPresent
+    tag: ""
+  imagePullSecrets: []
+  serviceAccount:
+    create: true
+    annotations: {}
+    name: ""
+  shutdownTimeout: "30s"
+  healthPort: 8081
+  leaderElection:
+    namespace: "kube-system"
+    id: "nodepartition-controller"
+  webhook:
+    port: 9443
+    tls:
+      # mode: openshift | cert-manager | manual
+      mode: "cert-manager"
+      certManager:
+        issuerName: "selfsigned-issuer"
+        issuerKind: "ClusterIssuer"
+      # For manual mode only:
+      caBundle: ""
+  networkPolicy:
+    enabled: false
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podLabels: {}
+  podAnnotations: {}
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault

@@ -1,0 +1,17 @@
+{{- if eq .Values.controller.webhook.tls.mode "cert-manager" }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "nodepartition.fullname" . }}-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nodepartition.controller.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "nodepartition.fullname" . }}-webhook-tls
+  dnsNames:
+    - {{ include "nodepartition.fullname" . }}-webhook.{{ .Release.Namespace }}.svc
+    - {{ include "nodepartition.fullname" . }}-webhook.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    name: {{ .Values.controller.webhook.tls.certManager.issuerName | default "selfsigned-issuer" }}
+    kind: {{ .Values.controller.webhook.tls.certManager.issuerKind | default "ClusterIssuer" }}
+{{- end }}
