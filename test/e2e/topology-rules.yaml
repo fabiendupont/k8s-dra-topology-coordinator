@@ -1,9 +1,11 @@
-# Topology rules for the mock-accel DRA driver.
+# Topology rules for mock-accel and dra-driver-cpu DRA drivers.
 # These ConfigMaps teach the coordinator how to read topology
-# attributes from mock-accel.example.com ResourceSlices.
+# attributes from each driver's ResourceSlices.
 #
 # Deploy these before the coordinator so it can map driver-specific
 # attribute names to standard topology attributes.
+
+# --- mock-accel rules ---
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -34,3 +36,35 @@ data:
   mapsTo: pcieRoot
   partitioning: group
   description: "Maps mock-accel PCI address to standard PCIe root attribute"
+
+# --- dra-driver-cpu rules ---
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cpu-numa-rule
+  namespace: default
+  labels:
+    nodepartition.dra.k8s.io/topology-rule: "true"
+data:
+  attribute: dra.cpu/numaNodeID
+  type: int
+  driver: dra.cpu
+  mapsTo: numaNode
+  partitioning: group
+  description: "Maps CPU DRA driver NUMA node ID to standard topology attribute"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cpu-socket-rule
+  namespace: default
+  labels:
+    nodepartition.dra.k8s.io/topology-rule: "true"
+data:
+  attribute: dra.cpu/socketID
+  type: int
+  driver: dra.cpu
+  mapsTo: socket
+  partitioning: group
+  description: "Maps CPU DRA driver socket ID to standard topology attribute"
