@@ -58,6 +58,11 @@ func NewController(client kubernetes.Interface, driverName string) *Controller {
 	}
 }
 
+// Model returns the topology model for use by the webhook.
+func (c *Controller) Model() *TopologyModel {
+	return c.model
+}
+
 // Run starts the controller. It blocks until the context is cancelled.
 func (c *Controller) Run(ctx context.Context) error {
 	klog.Info("Starting topology coordinator controller")

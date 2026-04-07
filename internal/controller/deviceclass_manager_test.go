@@ -192,6 +192,70 @@ func TestDeviceClassManager_WithMatchConstraintRules(t *testing.T) {
 	assert.True(t, hasNVLinkAlignment, "should have NVLink match constraint alignment")
 }
 
+func TestDeviceClassManager_EnforcementPropagation(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+
+	// Add a preferred enforcement match constraint rule
+	err := rules.LoadFromConfigMap(makeTopologyRuleConfigMap("preferred-numa", "default", map[string]string{
+		"attribute":   "gpu.nvidia.com/numaNode",
+		"type":        "int",
+		"driver":      "gpu.nvidia.com",
+		"constraint":  "match",
+		"enforcement": "preferred",
+	}))
+	require.NoError(t, err)
+
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	results := []PartitionResult{
+		{
+			NodeName: "node-1",
+			Profile:  "test",
+			Partitions: []PartitionDevice{
+				{
+					Name:    "node-1-half-0",
+					Type:    PartitionHalf,
+					Profile: "test",
+					DeviceCounts: map[string]int{
+						"gpu.nvidia.com": 4,
+					},
+				},
+			},
+		},
+	}
+
+	err = manager.SyncDeviceClasses(context.Background(), results)
+	require.NoError(t, err)
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, classes.Items, 1)
+
+	var config PartitionConfig
+	err = json.Unmarshal(classes.Items[0].Spec.Config[0].Opaque.Parameters.Raw, &config)
+	require.NoError(t, err)
+
+	// Standard alignments should be required
+	for _, a := range config.Alignments {
+		if a.Attribute == AttrNUMANode || a.Attribute == AttrPCIeRoot {
+			assert.Equal(t, EnforcementRequired, a.Enforcement,
+				"standard alignment %s should be required", a.Attribute)
+		}
+	}
+
+	// Rule-based alignment should be preferred
+	hasPreferred := false
+	for _, a := range config.Alignments {
+		if a.Attribute == "gpu.nvidia.com/numaNode" {
+			hasPreferred = true
+			assert.Equal(t, EnforcementPreferred, a.Enforcement,
+				"rule-based alignment should propagate preferred enforcement")
+		}
+	}
+	assert.True(t, hasPreferred, "should have preferred enforcement alignment from rule")
+}
+
 func TestDeviceClassManager_DeviceClassName(t *testing.T) {
 	manager := &DeviceClassManager{driverName: CoordinatorDriverName}
 

@@ -316,6 +316,82 @@ func (td TopologyDevice) deepCopy() TopologyDevice {
 	return cp
 }
 
+// IsConstraintSatisfiable checks whether at least one node in the topology model
+// has a group of devices sharing the same value for the given attribute where
+// every driver in driverCounts has at least the required number of devices.
+// This is used by the webhook to decide whether to emit "preferred" constraints.
+func (m *TopologyModel) IsConstraintSatisfiable(attribute string, driverCounts map[string]int) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, nt := range m.nodes {
+		if m.isConstraintSatisfiableOnNode(nt, attribute, driverCounts) {
+			return true
+		}
+	}
+	return false
+}
+
+// isConstraintSatisfiableOnNode checks whether a single node has at least one
+// group (same attribute value) that satisfies all driver count requirements.
+func (m *TopologyModel) isConstraintSatisfiableOnNode(nt *NodeTopology, attribute string, driverCounts map[string]int) bool {
+	// Collect all devices on this node, grouped by the attribute value.
+	// Key: attribute value as string, Value: map[driverName]count
+	groups := make(map[string]map[string]int)
+
+	for _, devices := range nt.DevicesByDriver {
+		for _, dev := range devices {
+			val := deviceAttributeValueString(dev, attribute)
+			if val == "" {
+				continue
+			}
+			if groups[val] == nil {
+				groups[val] = make(map[string]int)
+			}
+			groups[val][dev.DriverName]++
+		}
+	}
+
+	// Check if any group satisfies all driver count requirements.
+	for _, driverMap := range groups {
+		satisfied := true
+		for driver, needed := range driverCounts {
+			if driverMap[driver] < needed {
+				satisfied = false
+				break
+			}
+		}
+		if satisfied {
+			return true
+		}
+	}
+	return false
+}
+
+// deviceAttributeValueString returns the string representation of the device's
+// value for the given attribute, checking standard attributes and extended attributes.
+func deviceAttributeValueString(dev TopologyDevice, attribute string) string {
+	switch attribute {
+	case AttrNUMANode:
+		if dev.NUMANode != nil {
+			return fmt.Sprintf("%d", *dev.NUMANode)
+		}
+	case AttrPCIeRoot:
+		if dev.PCIeRoot != nil {
+			return *dev.PCIeRoot
+		}
+	case AttrSocket:
+		if dev.Socket != nil {
+			return fmt.Sprintf("%d", *dev.Socket)
+		}
+	default:
+		if v, ok := dev.ExtendedAttributes[attribute]; ok {
+			return v.String()
+		}
+	}
+	return ""
+}
+
 // extractTopologyDevice extracts topology attributes from a device's attributes.
 func (m *TopologyModel) extractTopologyDevice(
 	driverName, deviceName, nodeName, poolName string,

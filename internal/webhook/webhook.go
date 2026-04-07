@@ -30,6 +30,7 @@ const (
 type ClaimExpander struct {
 	client  kubernetes.Interface
 	decoder runtime.Decoder
+	model   *controller.TopologyModel
 }
 
 // jsonPatch represents a single JSON Patch operation.
@@ -40,13 +41,19 @@ type jsonPatch struct {
 }
 
 // NewClaimExpander creates a new ClaimExpander webhook handler.
-func NewClaimExpander(client kubernetes.Interface) *ClaimExpander {
+// The model parameter is optional; when provided, it enables satisfiability
+// checks for "preferred" enforcement constraints.
+func NewClaimExpander(client kubernetes.Interface, model ...*controller.TopologyModel) *ClaimExpander {
 	scheme := runtime.NewScheme()
 	codecs := serializer.NewCodecFactory(scheme)
-	return &ClaimExpander{
+	ce := &ClaimExpander{
 		client:  client,
 		decoder: codecs.UniversalDeserializer(),
 	}
+	if len(model) > 0 {
+		ce.model = model[0]
+	}
+	return ce
 }
 
 // Handler returns the HTTP handler for the webhook.
@@ -230,8 +237,22 @@ func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *con
 		})
 	}
 
+	// Build driver counts map for satisfiability checks
+	driverCounts := make(map[string]int, len(config.SubResources))
+	for _, sr := range config.SubResources {
+		driverCounts[sr.DeviceClass] = sr.Count
+	}
+
 	// Build constraints from alignments
 	for _, alignment := range config.Alignments {
+		// Skip preferred constraints that cannot be satisfied
+		if alignment.Enforcement == controller.EnforcementPreferred {
+			if ce.model == nil || !ce.model.IsConstraintSatisfiable(alignment.Attribute, driverCounts) {
+				klog.V(2).Infof("Skipping preferred constraint %s: not satisfiable (or no topology model)", alignment.Attribute)
+				continue
+			}
+		}
+
 		var resolvedRequests []string
 		for _, reqName := range alignment.Requests {
 			// Try to resolve the request name through the mapping

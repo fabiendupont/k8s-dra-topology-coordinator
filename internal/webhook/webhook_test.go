@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -490,6 +491,224 @@ func TestExpandClaimDirectly(t *testing.T) {
 		assert.True(t, ok, "unexpected request name: %s", r.Name)
 		require.NotNil(t, r.Exactly)
 		assert.Equal(t, expectedClass, r.Exactly.DeviceClassName)
+	}
+}
+
+func TestPreferredConstraintSkippedWhenUnsatisfiable(t *testing.T) {
+	partConfig := controller.PartitionConfig{
+		Kind: "PartitionConfig",
+		SubResources: []controller.SubResourceConfig{
+			{DeviceClass: "gpu.nvidia.com", Count: 2},
+			{DeviceClass: "rdma.mellanox.com", Count: 1},
+		},
+		Alignments: []controller.AlignmentConfig{
+			{
+				Attribute:   "nodepartition.dra.k8s.io/numaNode",
+				Requests:    []string{"gpu.nvidia.com", "rdma.mellanox.com"},
+				Enforcement: controller.EnforcementPreferred,
+			},
+			{
+				Attribute:   "resource.kubernetes.io/pcieRoot",
+				Requests:    []string{"gpu.nvidia.com", "rdma.mellanox.com"},
+				Enforcement: controller.EnforcementRequired,
+			},
+		},
+	}
+
+	partClass := makePartitionDeviceClass("test-partition", partConfig)
+	client := fake.NewSimpleClientset(partClass)
+
+	// Create a topology model where NUMA alignment is NOT satisfiable:
+	// GPUs on NUMA 0, NIC on NUMA 1
+	model := controller.NewTopologyModel()
+	model.UpdateFromResourceSlice(makeTopologyResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", 0, "pcie-0", 2))
+	model.UpdateFromResourceSlice(makeTopologyResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", 1, "pcie-1", 1))
+
+	expander := NewClaimExpander(client, model)
+
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: "default"},
+		Spec: resourcev1.ResourceClaimSpec{
+			Devices: resourcev1.DeviceClaim{
+				Requests: []resourcev1.DeviceRequest{
+					{
+						Name: "partition",
+						Exactly: &resourcev1.ExactDeviceRequest{
+							DeviceClassName: "test-partition",
+							Count:           1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	patches, err := expander.expandClaim(context.Background(), claim)
+	require.NoError(t, err)
+	require.NotEmpty(t, patches)
+
+	// Find constraints patch
+	var constraintsPatch *jsonPatch
+	for i := range patches {
+		if patches[i].Path == "/spec/devices/constraints" {
+			constraintsPatch = &patches[i]
+		}
+	}
+
+	require.NotNil(t, constraintsPatch)
+	conBytes, _ := json.Marshal(constraintsPatch.Value)
+	var constraints []resourcev1.DeviceConstraint
+	require.NoError(t, json.Unmarshal(conBytes, &constraints))
+
+	// Only the required PCIe constraint should remain; NUMA preferred should be skipped
+	assert.Len(t, constraints, 1, "preferred unsatisfiable constraint should be skipped")
+	assert.Equal(t, resourcev1.FullyQualifiedName("resource.kubernetes.io/pcieRoot"), *constraints[0].MatchAttribute)
+}
+
+func TestPreferredConstraintEmittedWhenSatisfiable(t *testing.T) {
+	partConfig := controller.PartitionConfig{
+		Kind: "PartitionConfig",
+		SubResources: []controller.SubResourceConfig{
+			{DeviceClass: "gpu.nvidia.com", Count: 2},
+			{DeviceClass: "rdma.mellanox.com", Count: 1},
+		},
+		Alignments: []controller.AlignmentConfig{
+			{
+				Attribute:   "nodepartition.dra.k8s.io/numaNode",
+				Requests:    []string{"gpu.nvidia.com", "rdma.mellanox.com"},
+				Enforcement: controller.EnforcementPreferred,
+			},
+		},
+	}
+
+	partClass := makePartitionDeviceClass("test-partition", partConfig)
+	client := fake.NewSimpleClientset(partClass)
+
+	// Create a topology model where NUMA alignment IS satisfiable:
+	// GPUs and NIC on same NUMA 0
+	model := controller.NewTopologyModel()
+	model.UpdateFromResourceSlice(makeTopologyResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", 0, "pcie-0", 2))
+	model.UpdateFromResourceSlice(makeTopologyResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", 0, "pcie-0", 1))
+
+	expander := NewClaimExpander(client, model)
+
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: "default"},
+		Spec: resourcev1.ResourceClaimSpec{
+			Devices: resourcev1.DeviceClaim{
+				Requests: []resourcev1.DeviceRequest{
+					{
+						Name: "partition",
+						Exactly: &resourcev1.ExactDeviceRequest{
+							DeviceClassName: "test-partition",
+							Count:           1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	patches, err := expander.expandClaim(context.Background(), claim)
+	require.NoError(t, err)
+	require.NotEmpty(t, patches)
+
+	var constraintsPatch *jsonPatch
+	for i := range patches {
+		if patches[i].Path == "/spec/devices/constraints" {
+			constraintsPatch = &patches[i]
+		}
+	}
+
+	require.NotNil(t, constraintsPatch)
+	conBytes, _ := json.Marshal(constraintsPatch.Value)
+	var constraints []resourcev1.DeviceConstraint
+	require.NoError(t, json.Unmarshal(conBytes, &constraints))
+
+	// NUMA constraint should be emitted because it's satisfiable
+	assert.Len(t, constraints, 1, "preferred satisfiable constraint should be emitted")
+	assert.Equal(t, resourcev1.FullyQualifiedName("nodepartition.dra.k8s.io/numaNode"), *constraints[0].MatchAttribute)
+}
+
+func TestPreferredConstraintSkippedWithoutModel(t *testing.T) {
+	partConfig := controller.PartitionConfig{
+		Kind: "PartitionConfig",
+		SubResources: []controller.SubResourceConfig{
+			{DeviceClass: "gpu.nvidia.com", Count: 2},
+		},
+		Alignments: []controller.AlignmentConfig{
+			{
+				Attribute:   "nodepartition.dra.k8s.io/numaNode",
+				Requests:    []string{"gpu.nvidia.com"},
+				Enforcement: controller.EnforcementPreferred,
+			},
+		},
+	}
+
+	partClass := makePartitionDeviceClass("test-partition", partConfig)
+	client := fake.NewSimpleClientset(partClass)
+
+	// No model provided — preferred constraints should be skipped
+	expander := NewClaimExpander(client)
+
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: "default"},
+		Spec: resourcev1.ResourceClaimSpec{
+			Devices: resourcev1.DeviceClaim{
+				Requests: []resourcev1.DeviceRequest{
+					{
+						Name: "partition",
+						Exactly: &resourcev1.ExactDeviceRequest{
+							DeviceClassName: "test-partition",
+							Count:           1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	patches, err := expander.expandClaim(context.Background(), claim)
+	require.NoError(t, err)
+
+	// With only preferred constraints and no model, there should be no constraints to add.
+	// The requests patch should still exist but no constraints patch.
+	var constraintsPatch *jsonPatch
+	for i := range patches {
+		if patches[i].Path == "/spec/devices/constraints" {
+			constraintsPatch = &patches[i]
+		}
+	}
+
+	// No constraints should be generated
+	assert.Nil(t, constraintsPatch, "preferred constraints without model should produce no constraints patch")
+}
+
+// makeTopologyResourceSlice creates a ResourceSlice with devices on a specific NUMA node and PCIe root.
+func makeTopologyResourceSlice(name, driver, nodeName, poolName string, numaNode int64, pcieRoot string, count int) *resourcev1.ResourceSlice {
+	var devices []resourcev1.Device
+	for i := 0; i < count; i++ {
+		devices = append(devices, resourcev1.Device{
+			Name: fmt.Sprintf("dev-%d", i),
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName("nodepartition.dra.k8s.io/numaNode"):  {IntValue: &numaNode},
+				resourcev1.QualifiedName("resource.kubernetes.io/pcieRoot"):     {StringValue: &pcieRoot},
+			},
+		})
+	}
+
+	return &resourcev1.ResourceSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: resourcev1.ResourceSliceSpec{
+			Driver:   driver,
+			NodeName: &nodeName,
+			Pool: resourcev1.ResourcePool{
+				Name:               poolName,
+				Generation:         1,
+				ResourceSliceCount: 1,
+			},
+			Devices: devices,
+		},
 	}
 }
 

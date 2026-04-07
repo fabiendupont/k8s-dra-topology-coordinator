@@ -457,6 +457,113 @@ func TestTopologyModel_SetRulesReextractsDevices(t *testing.T) {
 	assert.Equal(t, int64(1), *devices[0].NUMANode)
 }
 
+func TestTopologyModel_IsConstraintSatisfiable_NUMAAligned(t *testing.T) {
+	model := NewTopologyModel()
+
+	// Node with 2 GPUs on NUMA 0 and 2 NICs on NUMA 0
+	model.UpdateFromResourceSlice(makeResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+		makeGPUDevice("gpu-1", 0, "pcie-0"),
+	}))
+	model.UpdateFromResourceSlice(makeResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", []resourcev1.Device{
+		makeNICDevice("nic-0", 0, "pcie-0"),
+	}))
+
+	// 2 GPUs + 1 NIC on same NUMA → satisfiable
+	assert.True(t, model.IsConstraintSatisfiable(AttrNUMANode, map[string]int{
+		"gpu.nvidia.com":    2,
+		"rdma.mellanox.com": 1,
+	}))
+
+	// 3 GPUs on same NUMA → not satisfiable (only 2 on NUMA 0)
+	assert.False(t, model.IsConstraintSatisfiable(AttrNUMANode, map[string]int{
+		"gpu.nvidia.com": 3,
+	}))
+}
+
+func TestTopologyModel_IsConstraintSatisfiable_CrossNUMA(t *testing.T) {
+	model := NewTopologyModel()
+
+	// GPUs on NUMA 0, NICs on NUMA 1 — cross-NUMA, not alignable
+	model.UpdateFromResourceSlice(makeResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+	}))
+	model.UpdateFromResourceSlice(makeResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", []resourcev1.Device{
+		makeNICDevice("nic-0", 1, "pcie-1"),
+	}))
+
+	assert.False(t, model.IsConstraintSatisfiable(AttrNUMANode, map[string]int{
+		"gpu.nvidia.com":    1,
+		"rdma.mellanox.com": 1,
+	}))
+}
+
+func TestTopologyModel_IsConstraintSatisfiable_MultipleNodes(t *testing.T) {
+	model := NewTopologyModel()
+
+	// Node-1: cross-NUMA (not satisfiable)
+	model.UpdateFromResourceSlice(makeResourceSlice("gpu-1", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+	}))
+	model.UpdateFromResourceSlice(makeResourceSlice("nic-1", "rdma.mellanox.com", "node-1", "nic-pool", []resourcev1.Device{
+		makeNICDevice("nic-0", 1, "pcie-1"),
+	}))
+
+	// Node-2: same NUMA (satisfiable)
+	model.UpdateFromResourceSlice(makeResourceSlice("gpu-2", "gpu.nvidia.com", "node-2", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+	}))
+	model.UpdateFromResourceSlice(makeResourceSlice("nic-2", "rdma.mellanox.com", "node-2", "nic-pool", []resourcev1.Device{
+		makeNICDevice("nic-0", 0, "pcie-0"),
+	}))
+
+	// Should be satisfiable because node-2 has alignment
+	assert.True(t, model.IsConstraintSatisfiable(AttrNUMANode, map[string]int{
+		"gpu.nvidia.com":    1,
+		"rdma.mellanox.com": 1,
+	}))
+}
+
+func TestTopologyModel_IsConstraintSatisfiable_EmptyModel(t *testing.T) {
+	model := NewTopologyModel()
+
+	assert.False(t, model.IsConstraintSatisfiable(AttrNUMANode, map[string]int{
+		"gpu.nvidia.com": 1,
+	}))
+}
+
+func TestTopologyModel_IsConstraintSatisfiable_PCIeRoot(t *testing.T) {
+	model := NewTopologyModel()
+
+	// 2 GPUs and 1 NIC under the same PCIe root
+	model.UpdateFromResourceSlice(makeResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+		makeGPUDevice("gpu-1", 0, "pcie-0"),
+	}))
+	model.UpdateFromResourceSlice(makeResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", []resourcev1.Device{
+		makeNICDevice("nic-0", 0, "pcie-0"),
+	}))
+
+	assert.True(t, model.IsConstraintSatisfiable(AttrPCIeRoot, map[string]int{
+		"gpu.nvidia.com":    2,
+		"rdma.mellanox.com": 1,
+	}))
+
+	// Different PCIe roots → not satisfiable for PCIe constraint
+	model2 := NewTopologyModel()
+	model2.UpdateFromResourceSlice(makeResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+	}))
+	model2.UpdateFromResourceSlice(makeResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", []resourcev1.Device{
+		makeNICDevice("nic-0", 0, "pcie-1"),
+	}))
+
+	assert.False(t, model2.IsConstraintSatisfiable(AttrPCIeRoot, map[string]int{
+		"gpu.nvidia.com":    1,
+		"rdma.mellanox.com": 1,
+	}))
+}
+
 func TestTopologyModel_RemoveSliceCleansRawData(t *testing.T) {
 	model := NewTopologyModel()
 

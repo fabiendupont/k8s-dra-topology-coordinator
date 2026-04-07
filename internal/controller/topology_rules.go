@@ -33,6 +33,19 @@ const (
 	ConstraintNone ConstraintMode = "none"
 )
 
+// EnforcementMode defines whether a constraint is hard (must be satisfied) or
+// best-effort (applied only when the cluster can satisfy it).
+type EnforcementMode string
+
+const (
+	// EnforcementRequired means the constraint is always emitted. If it cannot
+	// be satisfied, the pod will not schedule.
+	EnforcementRequired EnforcementMode = "required"
+	// EnforcementPreferred means the constraint is emitted only when the
+	// topology model indicates it can be satisfied on at least one node.
+	EnforcementPreferred EnforcementMode = "preferred"
+)
+
 // StandardTopologyAttribute identifies a standard topology attribute for mapping.
 type StandardTopologyAttribute string
 
@@ -61,6 +74,10 @@ type TopologyRule struct {
 	Partitioning PartitioningMode
 	// Constraint defines how the attribute is used in combined claims.
 	Constraint ConstraintMode
+	// Enforcement defines whether the constraint is hard or best-effort.
+	// "required" (default) always emits the constraint.
+	// "preferred" only emits the constraint when satisfiable.
+	Enforcement EnforcementMode
 	// Description is a human-readable description of the attribute.
 	Description string
 }
@@ -99,8 +116,8 @@ func (s *TopologyRuleStore) LoadFromConfigMap(cm *corev1.ConfigMap) error {
 	defer s.mu.Unlock()
 	s.rules[cm.Namespace+"/"+cm.Name] = rule
 
-	klog.Infof("Loaded topology rule %q: attribute=%s driver=%s mapsTo=%s partitioning=%s constraint=%s",
-		rule.Name, rule.Attribute, rule.Driver, rule.MapsTo, rule.Partitioning, rule.Constraint)
+	klog.Infof("Loaded topology rule %q: attribute=%s driver=%s mapsTo=%s partitioning=%s constraint=%s enforcement=%s",
+		rule.Name, rule.Attribute, rule.Driver, rule.MapsTo, rule.Partitioning, rule.Constraint, rule.Enforcement)
 	return nil
 }
 
@@ -211,6 +228,18 @@ func parseTopologyRule(cm *corev1.ConfigMap) (TopologyRule, error) {
 		rule.Constraint = ConstraintNone // default
 	default:
 		return rule, fmt.Errorf("invalid constraint mode %q: must be match or none", constraint)
+	}
+
+	enforcement := cm.Data["enforcement"]
+	switch EnforcementMode(enforcement) {
+	case EnforcementRequired:
+		rule.Enforcement = EnforcementRequired
+	case EnforcementPreferred:
+		rule.Enforcement = EnforcementPreferred
+	case "":
+		rule.Enforcement = EnforcementRequired // default
+	default:
+		return rule, fmt.Errorf("invalid enforcement mode %q: must be required or preferred", enforcement)
 	}
 
 	rule.Description = cm.Data["description"]

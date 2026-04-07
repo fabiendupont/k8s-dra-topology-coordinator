@@ -296,6 +296,58 @@ func TestTopologyRuleStore_LoadFromConfigMap_MapsTo_PCIeRoot(t *testing.T) {
 	assert.Equal(t, MapsToPCIeRoot, rules[0].MapsTo)
 }
 
+func TestTopologyRuleStore_LoadFromConfigMap_Enforcement(t *testing.T) {
+	store := NewTopologyRuleStore()
+
+	cm := makeTopologyRuleConfigMap("preferred-rule", "default", map[string]string{
+		"attribute":   "mock-accel.example.com/numaNode",
+		"type":        "int",
+		"driver":      "mock-accel.example.com",
+		"constraint":  "match",
+		"enforcement": "preferred",
+	})
+
+	err := store.LoadFromConfigMap(cm)
+	require.NoError(t, err)
+
+	rules := store.GetRules()
+	require.Len(t, rules, 1)
+	assert.Equal(t, EnforcementPreferred, rules[0].Enforcement)
+}
+
+func TestTopologyRuleStore_LoadFromConfigMap_EnforcementDefault(t *testing.T) {
+	store := NewTopologyRuleStore()
+
+	cm := makeTopologyRuleConfigMap("no-enforcement", "default", map[string]string{
+		"attribute": "test/attr",
+		"type":      "int",
+		"driver":    "test",
+		// enforcement omitted — should default to required
+	})
+
+	err := store.LoadFromConfigMap(cm)
+	require.NoError(t, err)
+
+	rules := store.GetRules()
+	require.Len(t, rules, 1)
+	assert.Equal(t, EnforcementRequired, rules[0].Enforcement, "default enforcement should be required")
+}
+
+func TestTopologyRuleStore_LoadFromConfigMap_InvalidEnforcement(t *testing.T) {
+	store := NewTopologyRuleStore()
+
+	cm := makeTopologyRuleConfigMap("bad-enforcement", "default", map[string]string{
+		"attribute":   "test/attr",
+		"type":        "int",
+		"driver":      "test",
+		"enforcement": "invalid",
+	})
+
+	err := store.LoadFromConfigMap(cm)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid enforcement mode")
+}
+
 func TestTopologyRuleStore_LoadFromConfigMap_InvalidMapsTo(t *testing.T) {
 	store := NewTopologyRuleStore()
 

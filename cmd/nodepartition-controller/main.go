@@ -112,8 +112,10 @@ func runController(_ *cobra.Command, _ []string) error {
 	}
 	klog.Infof("Health check server started on port %d", healthCheckPort)
 
+	ctrl := controller.NewController(clientset, driverName)
+
 	// Start webhook server (runs on all replicas, not just the leader)
-	webhookServer, err := startWebhookServer(ctx, clientset)
+	webhookServer, err := startWebhookServer(ctx, clientset, ctrl.Model())
 	if err != nil {
 		return fmt.Errorf("failed to start webhook server: %v", err)
 	}
@@ -138,8 +140,6 @@ func runController(_ *cobra.Command, _ []string) error {
 			Identity: identity,
 		},
 	}
-
-	ctrl := controller.NewController(clientset, driverName)
 
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock:            lock,
@@ -182,8 +182,8 @@ func runController(_ *cobra.Command, _ []string) error {
 	return nil
 }
 
-func startWebhookServer(_ context.Context, clientset kubernetes.Interface) (*http.Server, error) { //nolint:unparam // error return reserved for TLS validation
-	expander := webhook.NewClaimExpander(clientset)
+func startWebhookServer(_ context.Context, clientset kubernetes.Interface, model *controller.TopologyModel) (*http.Server, error) { //nolint:unparam // error return reserved for TLS validation
+	expander := webhook.NewClaimExpander(clientset, model)
 
 	mux := http.NewServeMux()
 	mux.Handle("/mutate", expander.Handler())

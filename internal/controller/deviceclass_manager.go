@@ -36,8 +36,9 @@ type SubResourceConfig struct {
 
 // AlignmentConfig defines a matchAttribute constraint for the combined claim.
 type AlignmentConfig struct {
-	Attribute string   `json:"attribute"`
-	Requests  []string `json:"requests"`
+	Attribute   string          `json:"attribute"`
+	Requests    []string        `json:"requests"`
+	Enforcement EnforcementMode `json:"enforcement"`
 }
 
 // DeviceClassManager creates and manages DeviceClass objects based on discovered partition types.
@@ -203,8 +204,9 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 
 	// NUMA alignment between partition and all sub-resources
 	config.Alignments = append(config.Alignments, AlignmentConfig{
-		Attribute: AttrNUMANode,
-		Requests:  requestNames,
+		Attribute:   AttrNUMANode,
+		Requests:    requestNames,
+		Enforcement: EnforcementRequired,
 	})
 
 	// PCIe alignment between sub-resources (not partition itself, which may span roots)
@@ -214,8 +216,9 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 			subResourceNames = append(subResourceNames, driver)
 		}
 		config.Alignments = append(config.Alignments, AlignmentConfig{
-			Attribute: AttrPCIeRoot,
-			Requests:  subResourceNames,
+			Attribute:   AttrPCIeRoot,
+			Requests:    subResourceNames,
+			Enforcement: EnforcementRequired,
 		})
 	}
 
@@ -224,9 +227,14 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 	for _, rule := range matchRules {
 		// Only add match constraint if the representative has devices from this driver
 		if _, ok := representative.DeviceCounts[rule.Driver]; ok {
+			enforcement := rule.Enforcement
+			if enforcement == "" {
+				enforcement = EnforcementRequired
+			}
 			config.Alignments = append(config.Alignments, AlignmentConfig{
-				Attribute: rule.Attribute,
-				Requests:  requestNames,
+				Attribute:   rule.Attribute,
+				Requests:    requestNames,
+				Enforcement: enforcement,
 			})
 		}
 	}
