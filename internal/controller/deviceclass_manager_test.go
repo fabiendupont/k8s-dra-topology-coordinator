@@ -78,6 +78,17 @@ func TestDeviceClassManager_DeviceClassContents(t *testing.T) {
 						"gpu.nvidia.com":    4,
 						"rdma.mellanox.com": 4,
 					},
+					Devices: func() []TopologyDevice {
+						pcieRoot := "pci0000:00"
+						var devs []TopologyDevice
+						for i := 0; i < 4; i++ {
+							devs = append(devs, TopologyDevice{DriverName: "gpu.nvidia.com", PCIeRoot: &pcieRoot})
+						}
+						for i := 0; i < 4; i++ {
+							devs = append(devs, TopologyDevice{DriverName: "rdma.mellanox.com", PCIeRoot: &pcieRoot})
+						}
+						return devs
+					}(),
 				},
 			},
 		},
@@ -137,6 +148,85 @@ func TestDeviceClassManager_DeviceClassContents(t *testing.T) {
 		}
 	}
 	assert.True(t, hasPCIeAlignment, "should have PCIe alignment between sub-resources")
+}
+
+// TestDeviceClassManager_MixedPCIAndNonPCIDrivers verifies that pcieRoot alignment
+// constraints are only emitted for PCI-based drivers. When a partition contains a
+// mix of PCI devices (NICs, GPUs) and non-PCI devices (CPUs, memory), the pcieRoot
+// constraint must exclude non-PCI drivers — they don't publish
+// resource.kubernetes.io/pcieRoot, so including them makes the matchAttribute
+// constraint unsatisfiable at scheduling time.
+//
+// This is the primary regression test for the fix. Without it, a quarter partition
+// containing dra.cpu + SR-IOV NICs would produce a claim the scheduler rejects
+// with "cannot allocate all claims" because dra.cpu devices lack pcieRoot.
+//
+// NUMA alignment (numaNode) should still include ALL drivers regardless of PCI
+// status, since both PCI and non-PCI devices have NUMA affinity.
+func TestDeviceClassManager_MixedPCIAndNonPCIDrivers(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	pcieRoot := "pci0000:15"
+	results := []PartitionResult{
+		{
+			NodeName: "node-1",
+			Profile:  "test",
+			Partitions: []PartitionDevice{
+				{
+					Name:    "node-1-quarter-0",
+					Type:    PartitionQuarter,
+					Profile: "test",
+					// Simulates a real-world partition: SR-IOV NICs (PCI) + CPUs (non-PCI)
+					// on the same NUMA node, as seen on multi-NUMA servers like Dell XE9680.
+					DeviceCounts: map[string]int{
+						"sriovnetwork.k8snetworkplumbingwg.io": 2,
+						"dra.cpu": 1,
+					},
+					Devices: []TopologyDevice{
+						// NIC VFs are PCI devices — they publish pcieRoot
+						{DriverName: "sriovnetwork.k8snetworkplumbingwg.io", PCIeRoot: &pcieRoot},
+						{DriverName: "sriovnetwork.k8snetworkplumbingwg.io", PCIeRoot: &pcieRoot},
+						// CPUs are not PCI devices — PCIeRoot is nil
+						{DriverName: "dra.cpu", PCIeRoot: nil},
+					},
+				},
+			},
+		},
+	}
+
+	err := manager.SyncDeviceClasses(context.Background(), results)
+	require.NoError(t, err)
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, classes.Items, 1)
+
+	var config PartitionConfig
+	err = json.Unmarshal(classes.Items[0].Spec.Config[0].Opaque.Parameters.Raw, &config)
+	require.NoError(t, err)
+
+	// NUMA alignment should include ALL drivers — both PCI and non-PCI devices
+	// have NUMA affinity and must be co-located on the same NUMA node.
+	hasNUMAAlignment := false
+	for _, a := range config.Alignments {
+		if a.Attribute == AttrNUMANode {
+			hasNUMAAlignment = true
+			assert.Contains(t, a.Requests, "dra.cpu")
+			assert.Contains(t, a.Requests, "sriovnetwork.k8snetworkplumbingwg.io")
+		}
+	}
+	assert.True(t, hasNUMAAlignment, "should have NUMA alignment for all drivers")
+
+	// PCIe alignment should NOT exist here. Only 1 PCI driver (sriovnetwork) is
+	// present — pcieRoot matching requires 2+ PCI drivers. The non-PCI driver
+	// (dra.cpu) must not be counted as a PCI driver.
+	for _, a := range config.Alignments {
+		if a.Attribute == AttrPCIeRoot {
+			t.Fatal("should not have PCIe alignment when only 1 PCI driver exists")
+		}
+	}
 }
 
 func TestDeviceClassManager_WithMatchConstraintRules(t *testing.T) {

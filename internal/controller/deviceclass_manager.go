@@ -209,17 +209,29 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 		Enforcement: EnforcementRequired,
 	})
 
-	// PCIe alignment between sub-resources (not partition itself, which may span roots)
+	// PCIe alignment between PCI sub-resources only.
+	// Non-PCI drivers (e.g., dra.cpu) don't publish pcieRoot and must be excluded,
+	// otherwise the matchAttribute constraint is unsatisfiable.
+	// Alignment is only needed when 2+ PCI drivers exist to align.
 	if len(representative.DeviceCounts) > 1 {
-		subResourceNames := make([]string, 0, len(representative.DeviceCounts))
-		for driver := range representative.DeviceCounts {
-			subResourceNames = append(subResourceNames, driver)
+		pciDrivers := make(map[string]bool)
+		for _, dev := range representative.Devices {
+			if dev.PCIeRoot != nil {
+				pciDrivers[dev.DriverName] = true
+			}
 		}
-		config.Alignments = append(config.Alignments, AlignmentConfig{
-			Attribute:   AttrPCIeRoot,
-			Requests:    subResourceNames,
-			Enforcement: EnforcementRequired,
-		})
+
+		if len(pciDrivers) > 1 {
+			subResourceNames := make([]string, 0, len(pciDrivers))
+			for driver := range pciDrivers {
+				subResourceNames = append(subResourceNames, driver)
+			}
+			config.Alignments = append(config.Alignments, AlignmentConfig{
+				Attribute:   AttrPCIeRoot,
+				Requests:    subResourceNames,
+				Enforcement: EnforcementRequired,
+			})
+		}
 	}
 
 	// Match constraint alignments from topology rules
