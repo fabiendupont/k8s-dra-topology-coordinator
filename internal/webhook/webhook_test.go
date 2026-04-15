@@ -521,8 +521,8 @@ func TestPreferredConstraintSkippedWhenUnsatisfiable(t *testing.T) {
 	// Create a topology model where NUMA alignment is NOT satisfiable:
 	// GPUs on NUMA 0, NIC on NUMA 1
 	model := controller.NewTopologyModel()
-	model.UpdateFromResourceSlice(makeTopologyResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", 0, "pcie-0", 2))
-	model.UpdateFromResourceSlice(makeTopologyResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", 1, "pcie-1", 1))
+	model.UpdateFromResourceSlice(makeTopologyResourceSlice("gpu-slice", "gpu.nvidia.com", "gpu-pool", 0, "pcie-0", 2))
+	model.UpdateFromResourceSlice(makeTopologyResourceSlice("nic-slice", "rdma.mellanox.com", "nic-pool", 1, "pcie-1", 1))
 
 	expander := NewClaimExpander(client, model)
 
@@ -587,8 +587,8 @@ func TestPreferredConstraintEmittedWhenSatisfiable(t *testing.T) {
 	// Create a topology model where NUMA alignment IS satisfiable:
 	// GPUs and NIC on same NUMA 0
 	model := controller.NewTopologyModel()
-	model.UpdateFromResourceSlice(makeTopologyResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", 0, "pcie-0", 2))
-	model.UpdateFromResourceSlice(makeTopologyResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", 0, "pcie-0", 1))
+	model.UpdateFromResourceSlice(makeTopologyResourceSlice("gpu-slice", "gpu.nvidia.com", "gpu-pool", 0, "pcie-0", 2))
+	model.UpdateFromResourceSlice(makeTopologyResourceSlice("nic-slice", "rdma.mellanox.com", "nic-pool", 0, "pcie-0", 1))
 
 	expander := NewClaimExpander(client, model)
 
@@ -685,14 +685,15 @@ func TestPreferredConstraintSkippedWithoutModel(t *testing.T) {
 }
 
 // makeTopologyResourceSlice creates a ResourceSlice with devices on a specific NUMA node and PCIe root.
-func makeTopologyResourceSlice(name, driver, nodeName, poolName string, numaNode int64, pcieRoot string, count int) *resourcev1.ResourceSlice {
+func makeTopologyResourceSlice(name, driver, poolName string, numaNode int64, pcieRoot string, count int) *resourcev1.ResourceSlice {
+	nodeName := "node-1"
 	var devices []resourcev1.Device
 	for i := 0; i < count; i++ {
 		devices = append(devices, resourcev1.Device{
 			Name: fmt.Sprintf("dev-%d", i),
 			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-				resourcev1.QualifiedName("nodepartition.dra.k8s.io/numaNode"):  {IntValue: &numaNode},
-				resourcev1.QualifiedName("resource.kubernetes.io/pcieRoot"):     {StringValue: &pcieRoot},
+				resourcev1.QualifiedName("nodepartition.dra.k8s.io/numaNode"): {IntValue: &numaNode},
+				resourcev1.QualifiedName("resource.kubernetes.io/pcieRoot"):   {StringValue: &pcieRoot},
 			},
 		})
 	}

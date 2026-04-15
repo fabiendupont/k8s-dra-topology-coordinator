@@ -182,7 +182,7 @@ func TestDeviceClassManager_MixedPCIAndNonPCIDrivers(t *testing.T) {
 					// on the same NUMA node, as seen on multi-NUMA servers like Dell XE9680.
 					DeviceCounts: map[string]int{
 						"sriovnetwork.k8snetworkplumbingwg.io": 2,
-						"dra.cpu": 1,
+						"dra.cpu":                              1,
 					},
 					Devices: []TopologyDevice{
 						// NIC VFs are PCI devices — they publish pcieRoot
