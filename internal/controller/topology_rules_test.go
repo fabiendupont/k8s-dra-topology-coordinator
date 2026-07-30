@@ -348,6 +348,40 @@ func TestTopologyRuleStore_LoadFromConfigMap_InvalidEnforcement(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid enforcement mode")
 }
 
+func TestBuildNUMACELSelector_SingleValue(t *testing.T) {
+	cel := BuildNUMACELSelector("gpu.amd.com/numaNode", []int64{0})
+	assert.Equal(t, `device.attributes["gpu.amd.com"].numaNode == 0`, cel)
+}
+
+func TestBuildNUMACELSelector_MultipleValues(t *testing.T) {
+	cel := BuildNUMACELSelector("dra.cpu/numaNodeID", []int64{0, 1})
+	assert.Equal(t, `device.attributes["dra.cpu"].numaNodeID == 0 || device.attributes["dra.cpu"].numaNodeID == 1`, cel)
+}
+
+func TestBuildNUMACELSelector_InvalidAttribute(t *testing.T) {
+	cel := BuildNUMACELSelector("noSlash", []int64{0})
+	assert.Equal(t, "", cel)
+}
+
+func TestTopologyRuleStore_GetNUMAAttributeForDriver(t *testing.T) {
+	store := NewTopologyRuleStore()
+
+	err := store.LoadFromConfigMap(makeTopologyRuleConfigMap("gpu-numa", "default", map[string]string{
+		"attribute": "gpu.amd.com/numaNode",
+		"type":      "int",
+		"driver":    "gpu.amd.com",
+		"mapsTo":    "numaNode",
+	}))
+	require.NoError(t, err)
+
+	attr, ok := store.GetNUMAAttributeForDriver("gpu.amd.com")
+	assert.True(t, ok)
+	assert.Equal(t, "gpu.amd.com/numaNode", attr)
+
+	_, ok = store.GetNUMAAttributeForDriver("unknown.driver")
+	assert.False(t, ok)
+}
+
 func TestTopologyRuleStore_LoadFromConfigMap_InvalidMapsTo(t *testing.T) {
 	store := NewTopologyRuleStore()
 

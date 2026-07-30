@@ -130,24 +130,18 @@ func TestDeviceClassManager_DeviceClassContents(t *testing.T) {
 	assert.Equal(t, 4, subResourceMap["gpu.nvidia.com"])
 	assert.Equal(t, 4, subResourceMap["rdma.mellanox.com"])
 
-	// Verify alignments include NUMA
-	hasNUMAAlignment := false
+	// NUMA alignment is now handled by per-driver CEL selectors, not matchAttribute.
+	// This partition has no NUMANodes set, so sub-resources should have fallback
+	// CEL selectors using the standard dra.net/numaNode attribute.
+	// No NUMA matchAttribute alignment should exist.
 	for _, a := range config.Alignments {
 		if a.Attribute == AttrNUMANode {
-			hasNUMAAlignment = true
-			assert.Contains(t, a.Requests, "partition")
+			t.Fatal("should NOT have NUMA matchAttribute — use per-driver CEL selectors instead")
 		}
-	}
-	assert.True(t, hasNUMAAlignment, "should have NUMA alignment")
-
-	// Verify PCIe alignment between sub-resources
-	hasPCIeAlignment := false
-	for _, a := range config.Alignments {
 		if a.Attribute == AttrPCIeRoot {
-			hasPCIeAlignment = true
+			t.Fatal("should NOT have cross-driver PCIe alignment")
 		}
 	}
-	assert.True(t, hasPCIeAlignment, "should have PCIe alignment between sub-resources")
 }
 
 // TestDeviceClassManager_MixedPCIAndNonPCIDrivers verifies that pcieRoot alignment
@@ -175,9 +169,10 @@ func TestDeviceClassManager_MixedPCIAndNonPCIDrivers(t *testing.T) {
 			Profile:  "test",
 			Partitions: []PartitionDevice{
 				{
-					Name:    "node-1-quarter-0",
-					Type:    PartitionQuarter,
-					Profile: "test",
+					Name:      "node-1-quarter-0",
+					Type:      PartitionQuarter,
+					Profile:   "test",
+					NUMANodes: []int64{0},
 					// Simulates a real-world partition: SR-IOV NICs (PCI) + CPUs (non-PCI)
 					// on the same NUMA node, as seen on multi-NUMA servers like Dell XE9680.
 					DeviceCounts: map[string]int{
@@ -207,25 +202,22 @@ func TestDeviceClassManager_MixedPCIAndNonPCIDrivers(t *testing.T) {
 	err = json.Unmarshal(classes.Items[0].Spec.Config[0].Opaque.Parameters.Raw, &config)
 	require.NoError(t, err)
 
-	// NUMA alignment should include ALL drivers — both PCI and non-PCI devices
-	// have NUMA affinity and must be co-located on the same NUMA node.
-	hasNUMAAlignment := false
+	// NUMA alignment is now per-driver CEL selectors, not matchAttribute.
+	// No NUMA or PCIe matchAttribute should exist.
 	for _, a := range config.Alignments {
 		if a.Attribute == AttrNUMANode {
-			hasNUMAAlignment = true
-			assert.Contains(t, a.Requests, "dra.cpu")
-			assert.Contains(t, a.Requests, "sriovnetwork.k8snetworkplumbingwg.io")
+			t.Fatal("should NOT have NUMA matchAttribute — use per-driver CEL selectors instead")
+		}
+		if a.Attribute == AttrPCIeRoot {
+			t.Fatal("should NOT have PCIe alignment")
 		}
 	}
-	assert.True(t, hasNUMAAlignment, "should have NUMA alignment for all drivers")
 
-	// PCIe alignment should NOT exist here. Only 1 PCI driver (sriovnetwork) is
-	// present — pcieRoot matching requires 2+ PCI drivers. The non-PCI driver
-	// (dra.cpu) must not be counted as a PCI driver.
-	for _, a := range config.Alignments {
-		if a.Attribute == AttrPCIeRoot {
-			t.Fatal("should not have PCIe alignment when only 1 PCI driver exists")
-		}
+	// Each sub-resource should have a fallback NUMA CEL selector using dra.net/numaNode
+	// (no topology rules configured, so fallback to standard attribute)
+	for _, sr := range config.SubResources {
+		assert.NotEmpty(t, sr.Selectors,
+			"sub-resource %s should have NUMA CEL selector", sr.DeviceClass)
 	}
 }
 
@@ -326,17 +318,14 @@ func TestDeviceClassManager_EnforcementPropagation(t *testing.T) {
 	err = json.Unmarshal(classes.Items[0].Spec.Config[0].Opaque.Parameters.Raw, &config)
 	require.NoError(t, err)
 
-	// Standard alignments should be required
-	for _, a := range config.Alignments {
-		if a.Attribute == AttrNUMANode || a.Attribute == AttrPCIeRoot {
-			assert.Equal(t, EnforcementRequired, a.Enforcement,
-				"standard alignment %s should be required", a.Attribute)
-		}
-	}
-
-	// Rule-based alignment should be preferred
+	// NUMA is now per-driver CEL, no matchAttribute.
+	// But rule-based match constraints (like gpu.nvidia.com/numaNode with constraint=match)
+	// should still be emitted as matchAttribute alignments with their enforcement mode.
 	hasPreferred := false
 	for _, a := range config.Alignments {
+		if a.Attribute == AttrNUMANode {
+			t.Fatal("should NOT have NUMA matchAttribute")
+		}
 		if a.Attribute == "gpu.nvidia.com/numaNode" {
 			hasPreferred = true
 			assert.Equal(t, EnforcementPreferred, a.Enforcement,
@@ -344,6 +333,86 @@ func TestDeviceClassManager_EnforcementPropagation(t *testing.T) {
 		}
 	}
 	assert.True(t, hasPreferred, "should have preferred enforcement alignment from rule")
+}
+
+func TestDeviceClassManager_PerDriverCELSelectors(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+
+	// Configure topology rules for GPU and CPU drivers with different NUMA attribute names
+	err := rules.LoadFromConfigMap(makeTopologyRuleConfigMap("gpu-numa", "default", map[string]string{
+		"attribute": "gpu.amd.com/numaNode",
+		"type":      "int",
+		"driver":    "gpu.amd.com",
+		"mapsTo":    "numaNode",
+	}))
+	require.NoError(t, err)
+
+	err = rules.LoadFromConfigMap(makeTopologyRuleConfigMap("cpu-numa", "default", map[string]string{
+		"attribute": "dra.cpu/numaNodeID",
+		"type":      "int",
+		"driver":    "dra.cpu",
+		"mapsTo":    "numaNode",
+	}))
+	require.NoError(t, err)
+
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	results := []PartitionResult{
+		{
+			NodeName: "node-1",
+			Profile:  "test",
+			Partitions: []PartitionDevice{
+				{
+					Name:      "node-1-quarter-0",
+					Type:      PartitionQuarter,
+					Profile:   "test",
+					NUMANodes: []int64{0},
+					DeviceCounts: map[string]int{
+						"gpu.amd.com": 1,
+						"dra.cpu":     1,
+					},
+				},
+			},
+		},
+	}
+
+	err = manager.SyncDeviceClasses(context.Background(), results)
+	require.NoError(t, err)
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, classes.Items, 1)
+
+	var config PartitionConfig
+	err = json.Unmarshal(classes.Items[0].Spec.Config[0].Opaque.Parameters.Raw, &config)
+	require.NoError(t, err)
+
+	// Each sub-resource should have a CEL selector using its driver's own attribute name
+	selectorMap := make(map[string][]string)
+	for _, sr := range config.SubResources {
+		selectorMap[sr.DeviceClass] = sr.Selectors
+	}
+
+	// GPU should use gpu.amd.com/numaNode
+	gpuSelectors := selectorMap["gpu.amd.com"]
+	require.Len(t, gpuSelectors, 1)
+	assert.Equal(t, `device.attributes["gpu.amd.com"].numaNode == 0`, gpuSelectors[0])
+
+	// CPU should use dra.cpu/numaNodeID
+	cpuSelectors := selectorMap["dra.cpu"]
+	require.Len(t, cpuSelectors, 1)
+	assert.Equal(t, `device.attributes["dra.cpu"].numaNodeID == 0`, cpuSelectors[0])
+
+	// No NUMA matchAttribute alignment should exist
+	for _, a := range config.Alignments {
+		if a.Attribute == AttrNUMANode {
+			t.Fatal("should NOT have NUMA matchAttribute — per-driver CEL selectors replace it")
+		}
+	}
+
+	// DeviceClass name should include NUMA suffix
+	assert.Contains(t, classes.Items[0].Name, "numa0")
 }
 
 func TestDeviceClassManager_DeviceClassName(t *testing.T) {

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -167,6 +168,51 @@ func (s *TopologyRuleStore) GetMatchConstraintRules() []TopologyRule {
 		}
 	}
 	return result
+}
+
+// GetNUMAAttributeForDriver returns the fully qualified attribute name that a
+// specific driver uses for NUMA node topology. It searches topology rules for
+// a rule matching the driver with mapsTo=numaNode.
+// Returns ("", false) if no rule is found for the driver.
+func (s *TopologyRuleStore) GetNUMAAttributeForDriver(driverName string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, rule := range s.rules {
+		if rule.Driver == driverName && rule.MapsTo == MapsToNUMANode {
+			return rule.Attribute, true
+		}
+	}
+	return "", false
+}
+
+// BuildNUMACELSelector generates a CEL expression that pins devices from a
+// specific driver to the given NUMA node value(s), using the driver's own
+// attribute namespace. For example:
+//
+//	attribute="gpu.amd.com/numaNode", values=[0]
+//	→ device.attributes["gpu.amd.com"].numaNode == 0
+//
+//	attribute="dra.cpu/numaNodeID", values=[0, 1]
+//	→ device.attributes["dra.cpu"].numaNodeID == 0 || device.attributes["dra.cpu"].numaNodeID == 1
+func BuildNUMACELSelector(attribute string, numaValues []int64) string {
+	parts := strings.SplitN(attribute, "/", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	domain := parts[0]
+	name := parts[1]
+
+	if len(numaValues) == 1 {
+		return fmt.Sprintf(`device.attributes["%s"].%s == %d`, domain, name, numaValues[0])
+	}
+
+	// Multiple NUMA values: OR expression
+	var clauses []string
+	for _, v := range numaValues {
+		clauses = append(clauses, fmt.Sprintf(`device.attributes["%s"].%s == %d`, domain, name, v))
+	}
+	return strings.Join(clauses, " || ")
 }
 
 // parseTopologyRule parses a TopologyRule from a ConfigMap's data fields.
