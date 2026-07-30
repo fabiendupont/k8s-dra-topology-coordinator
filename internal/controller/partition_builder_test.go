@@ -71,11 +71,10 @@ func TestPartitionBuilder_HGXScenario(t *testing.T) {
 		counts[p.Type]++
 	}
 
-	// With 8 unique PCIe roots: should get 8 eighth-partitions
-	assert.Equal(t, 8, counts[PartitionEighth], "expected 8 eighth-partitions (one per PCIe root)")
-
-	// With 4 NUMA nodes: should get 4 quarter-partitions
-	assert.Equal(t, 4, counts[PartitionQuarter], "expected 4 quarter-partitions (one per NUMA)")
+	// With 4 NUMA nodes × 2 PCIe roots each: buildProportionalPartitions
+	// creates 2 partitions per NUMA = 8 total for both eighth and quarter
+	assert.Equal(t, 8, counts[PartitionEighth], "expected 8 eighth-partitions (2 per NUMA × 4 NUMA nodes)")
+	assert.Equal(t, 8, counts[PartitionQuarter], "expected 8 quarter-partitions (2 per NUMA × 4 NUMA nodes)")
 
 	// With 2 sockets: should get 2 half-partitions
 	assert.Equal(t, 2, counts[PartitionHalf], "expected 2 half-partitions (one per socket)")
@@ -94,7 +93,8 @@ func TestPartitionBuilder_EighthPartitionContents(t *testing.T) {
 	results := builder.BuildPartitions()
 	require.Len(t, results, 1)
 
-	// Each eighth-partition should contain 1 GPU + 1 NIC
+	// Each eighth-partition should have proportional device counts (1 GPU + 1 NIC)
+	// and a single NUMA node
 	for _, p := range results[0].Partitions {
 		if p.Type == PartitionEighth {
 			totalDevices := 0
@@ -102,8 +102,8 @@ func TestPartitionBuilder_EighthPartitionContents(t *testing.T) {
 				totalDevices += count
 			}
 			assert.Equal(t, 2, totalDevices,
-				"eighth partition %s should contain exactly 2 devices (1 GPU + 1 NIC)", p.Name)
-			assert.Len(t, p.PCIeRoots, 1, "eighth partition should span exactly 1 PCIe root")
+				"eighth partition %s should have 2 device counts (1 GPU + 1 NIC)", p.Name)
+			assert.Len(t, p.NUMANodes, 1, "eighth partition should have exactly 1 NUMA node")
 		}
 	}
 }
@@ -118,15 +118,16 @@ func TestPartitionBuilder_QuarterPartitionContents(t *testing.T) {
 	results := builder.BuildPartitions()
 	require.Len(t, results, 1)
 
+	// Each quarter-partition should have proportional device counts (1 GPU + 1 NIC)
 	for _, p := range results[0].Partitions {
 		if p.Type == PartitionQuarter {
 			totalDevices := 0
 			for _, count := range p.DeviceCounts {
 				totalDevices += count
 			}
-			assert.Equal(t, 4, totalDevices,
-				"quarter partition %s should contain 4 devices (2 GPU + 2 NIC)", p.Name)
-			assert.Len(t, p.NUMANodes, 1, "quarter partition should span exactly 1 NUMA node")
+			assert.Equal(t, 2, totalDevices,
+				"quarter partition %s should have 2 device counts (1 GPU + 1 NIC)", p.Name)
+			assert.Len(t, p.NUMANodes, 1, "quarter partition should have exactly 1 NUMA node")
 		}
 	}
 }

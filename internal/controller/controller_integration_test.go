@@ -154,7 +154,6 @@ func TestIntegration_ControllerCreatesDeviceClasses(t *testing.T) {
 			assert.NoError(t, err, "should unmarshal PartitionConfig")
 			assert.Equal(t, "PartitionConfig", partConfig.Kind)
 			assert.NotEmpty(t, partConfig.SubResources, "should have sub-resources")
-			assert.NotEmpty(t, partConfig.Alignments, "should have alignments")
 		}
 	}
 }

@@ -12,7 +12,7 @@ import (
 
 // Standard topology attribute qualified names that all participating DRA drivers must publish.
 const (
-	AttrNUMANode = "nodepartition.dra.k8s.io/numaNode"
+	AttrNUMANode = "dra.net/numaNode"
 	AttrPCIeRoot = "resource.kubernetes.io/pcieRoot"
 	AttrSocket   = "nodepartition.dra.k8s.io/socket"
 )
@@ -36,6 +36,10 @@ type TopologyDevice struct {
 
 	// Extended attributes from topology rules (attribute qualified name -> value).
 	ExtendedAttributes map[string]DeviceAttributeValue
+
+	// Capacity holds consumable capacity from the ResourceSlice device.
+	// Key is the capacity name, value is the total quantity string.
+	Capacity map[string]string
 }
 
 // DeviceAttributeValue holds a typed attribute value.
@@ -189,6 +193,13 @@ func (m *TopologyModel) applySliceDataLocked(raw rawSliceData) {
 	var devices []TopologyDevice
 	for _, device := range raw.Devices {
 		td := m.extractTopologyDevice(raw.DriverName, device.Name, raw.NodeName, raw.PoolName, device.Attributes)
+		// Extract capacity info
+		if device.Capacity != nil {
+			td.Capacity = make(map[string]string)
+			for capName, capSpec := range device.Capacity {
+				td.Capacity[string(capName)] = capSpec.Value.String()
+			}
+		}
 		devices = append(devices, td)
 	}
 

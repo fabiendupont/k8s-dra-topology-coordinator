@@ -92,7 +92,12 @@ func TestProperty_DeviceAppearsOncePerGranularity(t *testing.T) {
 				byType[p.Type] = append(byType[p.Type], p)
 			}
 
+			// Only check non-proportional partitions (half, full).
+			// Proportional partitions (eighth, quarter) share devices across subdivisions.
 			for partType, partitions := range byType {
+				if partType == PartitionEighth || partType == PartitionQuarter {
+					continue
+				}
 				seen := make(map[string]string)
 				for _, p := range partitions {
 					for _, d := range p.Devices {
@@ -280,6 +285,16 @@ func TestProperty_DeviceCountsMatchActualDevices(t *testing.T) {
 
 		for _, result := range results {
 			for _, p := range result.Partitions {
+				// Proportional partitions have divided DeviceCounts
+				if p.Type == PartitionEighth || p.Type == PartitionQuarter {
+					for driver, count := range p.DeviceCounts {
+						assert.Greater(t, count, 0,
+							"trial %d, node %s, partition %s: driver %s has zero count",
+							trial, result.NodeName, p.Name, driver)
+					}
+					continue
+				}
+
 				actualCounts := make(map[string]int)
 				for _, d := range p.Devices {
 					actualCounts[baseDriverName(d.DriverName)]++

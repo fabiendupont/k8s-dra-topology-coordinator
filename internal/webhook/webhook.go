@@ -12,6 +12,7 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
@@ -228,12 +229,46 @@ func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *con
 		requestNameMap[sr.DeviceClass] = name
 
 		count := int64(sr.Count)
+		exact := &resourcev1.ExactDeviceRequest{
+			DeviceClassName: sr.DeviceClass,
+			Count:           count,
+		}
+
+		// Add capacity requests for shared devices (DRAConsumableCapacity)
+		if len(sr.Capacity) > 0 {
+			exact.Capacity = &resourcev1.CapacityRequirements{
+				Requests: make(map[resourcev1.QualifiedName]resource.Quantity),
+			}
+			for capName, capVal := range sr.Capacity {
+				qty, err := resource.ParseQuantity(capVal)
+				if err == nil {
+					exact.Capacity.Requests[resourcev1.QualifiedName(capName)] = qty
+				}
+			}
+		}
+
+		// Apply per-driver CEL selectors from the PartitionConfig.
+		// These pin each sub-request to the correct NUMA node using the
+		// driver's own attribute namespace (e.g., gpu.amd.com/numaNode),
+		// eliminating the need for a common cross-driver attribute name.
+		for _, cel := range sr.Selectors {
+			exact.Selectors = append(exact.Selectors, resourcev1.DeviceSelector{
+				CEL: &resourcev1.CELDeviceSelector{
+					Expression: cel,
+				},
+			})
+		}
+
+		// Forward any user-specified selectors from the original partition request
+		// to each expanded sub-request. This enables NUMA pinning (e.g.,
+		// numaNode==0) and other user-specified device filtering.
+		if req.Exactly != nil && len(req.Exactly.Selectors) > 0 {
+			exact.Selectors = append(exact.Selectors, req.Exactly.Selectors...)
+		}
+
 		subRequests = append(subRequests, resourcev1.DeviceRequest{
-			Name: name,
-			Exactly: &resourcev1.ExactDeviceRequest{
-				DeviceClassName: sr.DeviceClass,
-				Count:           count,
-			},
+			Name:    name,
+			Exactly: exact,
 		})
 	}
 

@@ -148,7 +148,7 @@ func TestPartitionClaimIsExpanded(t *testing.T) {
 		},
 		Alignments: []controller.AlignmentConfig{
 			{
-				Attribute: "nodepartition.dra.k8s.io/numaNode",
+				Attribute: "dra.net/numaNode",
 				Requests:  []string{"gpu.nvidia.com", "rdma.mellanox.com"},
 			},
 		},
@@ -430,7 +430,7 @@ func TestExpandClaimDirectly(t *testing.T) {
 		},
 		Alignments: []controller.AlignmentConfig{
 			{
-				Attribute: "nodepartition.dra.k8s.io/numaNode",
+				Attribute: "dra.net/numaNode",
 				Requests:  []string{"gpu.nvidia.com", "rdma.mellanox.com"},
 			},
 			{
@@ -503,7 +503,7 @@ func TestPreferredConstraintSkippedWhenUnsatisfiable(t *testing.T) {
 		},
 		Alignments: []controller.AlignmentConfig{
 			{
-				Attribute:   "nodepartition.dra.k8s.io/numaNode",
+				Attribute:   "dra.net/numaNode",
 				Requests:    []string{"gpu.nvidia.com", "rdma.mellanox.com"},
 				Enforcement: controller.EnforcementPreferred,
 			},
@@ -574,7 +574,7 @@ func TestPreferredConstraintEmittedWhenSatisfiable(t *testing.T) {
 		},
 		Alignments: []controller.AlignmentConfig{
 			{
-				Attribute:   "nodepartition.dra.k8s.io/numaNode",
+				Attribute:   "dra.net/numaNode",
 				Requests:    []string{"gpu.nvidia.com", "rdma.mellanox.com"},
 				Enforcement: controller.EnforcementPreferred,
 			},
@@ -627,7 +627,7 @@ func TestPreferredConstraintEmittedWhenSatisfiable(t *testing.T) {
 
 	// NUMA constraint should be emitted because it's satisfiable
 	assert.Len(t, constraints, 1, "preferred satisfiable constraint should be emitted")
-	assert.Equal(t, resourcev1.FullyQualifiedName("nodepartition.dra.k8s.io/numaNode"), *constraints[0].MatchAttribute)
+	assert.Equal(t, resourcev1.FullyQualifiedName("dra.net/numaNode"), *constraints[0].MatchAttribute)
 }
 
 func TestPreferredConstraintSkippedWithoutModel(t *testing.T) {
@@ -638,7 +638,7 @@ func TestPreferredConstraintSkippedWithoutModel(t *testing.T) {
 		},
 		Alignments: []controller.AlignmentConfig{
 			{
-				Attribute:   "nodepartition.dra.k8s.io/numaNode",
+				Attribute:   "dra.net/numaNode",
 				Requests:    []string{"gpu.nvidia.com"},
 				Enforcement: controller.EnforcementPreferred,
 			},
@@ -692,8 +692,8 @@ func makeTopologyResourceSlice(name, driver, poolName string, numaNode int64, pc
 		devices = append(devices, resourcev1.Device{
 			Name: fmt.Sprintf("dev-%d", i),
 			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-				resourcev1.QualifiedName("nodepartition.dra.k8s.io/numaNode"): {IntValue: &numaNode},
-				resourcev1.QualifiedName("resource.kubernetes.io/pcieRoot"):   {StringValue: &pcieRoot},
+				resourcev1.QualifiedName("dra.net/numaNode"):                {IntValue: &numaNode},
+				resourcev1.QualifiedName("resource.kubernetes.io/pcieRoot"): {StringValue: &pcieRoot},
 			},
 		})
 	}

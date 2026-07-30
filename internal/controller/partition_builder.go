@@ -3,8 +3,10 @@ package controller
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	klog "k8s.io/klog/v2"
 )
 
@@ -36,6 +38,9 @@ type PartitionDevice struct {
 
 	// DeviceCounts maps driver name -> count of devices from that driver in this partition.
 	DeviceCounts map[string]int
+	// DeviceCapacity maps driver name -> capacity requests for shared devices.
+	// Used when a device is shared via DRAConsumableCapacity (count=1 but subdivided).
+	DeviceCapacity map[string]map[string]string
 	// Devices lists the individual topology devices grouped into this partition.
 	Devices []TopologyDevice
 
@@ -109,14 +114,6 @@ func (b *PartitionBuilder) buildNodePartitions(
 		driverDeviceCounts[baseName]++
 	}
 
-	// Group devices by PCIe root for the finest-grained partitioning
-	byPCIeRoot := groupDevicesByAttribute(allDevices, func(d TopologyDevice) string {
-		if d.PCIeRoot != nil {
-			return *d.PCIeRoot
-		}
-		return ""
-	})
-
 	// Group devices by NUMA node
 	byNUMA := groupDevicesByAttribute(allDevices, func(d TopologyDevice) string {
 		if d.NUMANode != nil {
@@ -145,13 +142,16 @@ func (b *PartitionBuilder) buildNodePartitions(
 	profile := b.inferProfile(driverDeviceCounts)
 	result.Profile = profile
 
-	// Eighth: one partition per PCIe root (finest grain)
-	eighths := b.buildPartitionsFromGroups(nodeName, profile, PartitionEighth, byPCIeRoot, groupingRules)
+	// Eighth: subdivide each NUMA node proportionally by PCIe root count.
+	// Each eighth gets 1 GPU + proportional NICs + shared CPU/memory with divided capacity.
+	eighths := b.buildProportionalPartitions(nodeName, profile, PartitionEighth, byNUMA, allDevices)
 	result.Partitions = append(result.Partitions, eighths...)
 
-	// Quarter: one partition per NUMA node
-	quarters := b.buildPartitionsFromGroups(nodeName, profile, PartitionQuarter, byNUMA, groupingRules)
-	result.Partitions = append(result.Partitions, quarters...)
+	// Quarter: same proportional subdivision as eighth on this hardware.
+	// On systems where PCIe roots group multiple devices (e.g., 2 GPUs per switch),
+	// quarter would have fewer, larger partitions than eighth.
+	quarterGroups := b.buildProportionalPartitions(nodeName, profile, PartitionQuarter, byNUMA, allDevices)
+	result.Partitions = append(result.Partitions, quarterGroups...)
 
 	// Half: one partition per socket
 	halves := b.buildPartitionsFromGroups(nodeName, profile, PartitionHalf, bySocket, groupingRules)
@@ -166,7 +166,7 @@ func (b *PartitionBuilder) buildNodePartitions(
 	klog.Infof("Node %s (profile=%s): computed %d partitions (%d eighth, %d quarter, %d half, %d full)",
 		nodeName, profile,
 		len(result.Partitions),
-		len(eighths), len(quarters), len(halves),
+		len(eighths), len(quarterGroups), len(halves),
 		boolToInt(full != nil))
 
 	return result
@@ -226,6 +226,135 @@ func (b *PartitionBuilder) buildPartitionsFromGroups(
 			nodeName, profile, partType, devices,
 		)
 		partitions = append(partitions, p)
+	}
+
+	return partitions
+}
+
+// buildProportionalPartitions subdivides each NUMA node into equal partitions.
+// It counts PCIe root groups per NUMA to determine the subdivision factor,
+// then divides all device types proportionally. Shared devices (count=1 per NUMA)
+// get capacity divided via DRAConsumableCapacity.
+func (b *PartitionBuilder) buildProportionalPartitions(
+	nodeName, profile string,
+	partType PartitionType,
+	byNUMA map[string][]TopologyDevice,
+	allDevices []TopologyDevice,
+) []PartitionDevice {
+	// Count PCIe root groups per NUMA node to determine subdivision factor
+	numaSubdivisions := make(map[string]int) // NUMA key → number of PCIe roots
+	for _, d := range allDevices {
+		if d.NUMANode == nil || d.PCIeRoot == nil {
+			continue
+		}
+		numaKey := fmt.Sprintf("%d", *d.NUMANode)
+		numaSubdivisions[numaKey]++
+	}
+
+	// Deduplicate: count unique PCIe roots per NUMA
+	numaPCIeRoots := make(map[string]map[string]bool)
+	for _, d := range allDevices {
+		if d.NUMANode == nil || d.PCIeRoot == nil {
+			continue
+		}
+		numaKey := fmt.Sprintf("%d", *d.NUMANode)
+		if numaPCIeRoots[numaKey] == nil {
+			numaPCIeRoots[numaKey] = make(map[string]bool)
+		}
+		numaPCIeRoots[numaKey][*d.PCIeRoot] = true
+	}
+
+	// For each NUMA node, compute how many quarter partitions to create
+	var partitions []PartitionDevice
+	partIdx := 0
+
+	numaKeys := make([]string, 0, len(byNUMA))
+	for k := range byNUMA {
+		if k != "" {
+			numaKeys = append(numaKeys, k)
+		}
+	}
+	sort.Strings(numaKeys)
+
+	for _, numaKey := range numaKeys {
+		devices := byNUMA[numaKey]
+		numPCIeRoots := len(numaPCIeRoots[numaKey])
+		if numPCIeRoots <= 1 {
+			continue // no subdivision possible
+		}
+
+		// Count devices per driver on this NUMA node
+		driverCounts := make(map[string]int)
+		for _, d := range devices {
+			baseName := baseDriverName(d.DriverName)
+			driverCounts[baseName]++
+		}
+
+		// Determine subdivision factor: use the number of unique PCIe roots
+		// but only consider drivers with multiple devices (>1).
+		// Drivers with 1 device per NUMA (e.g., CPU, memory) are shared
+		// via DRAConsumableCapacity and don't limit subdivision.
+		subdivisions := numPCIeRoots
+		for driver, count := range driverCounts {
+			if count > 1 && count < subdivisions {
+				klog.V(4).Infof("NUMA %s: reducing subdivisions from %d to %d (limited by %s with %d devices)",
+					numaKey, subdivisions, count, driver, count)
+				subdivisions = count
+			}
+		}
+
+		if subdivisions <= 1 {
+			continue
+		}
+
+		// Parse NUMA node ID for topology-aware CEL selectors
+		numaVal, _ := strconv.ParseInt(numaKey, 10, 64)
+
+		// Create subdivided partitions
+		for i := 0; i < subdivisions; i++ {
+			p := PartitionDevice{
+				Name:               fmt.Sprintf("%s-%s-%d", nodeName, partType, partIdx),
+				NodeName:           nodeName,
+				Type:               partType,
+				Profile:            profile,
+				NUMANodes:          []int64{numaVal},
+				DeviceCounts:       make(map[string]int),
+				Devices:            nil, // representative only
+				ExtendedAttributes: make(map[string]DeviceAttributeValue),
+			}
+
+			p.DeviceCapacity = make(map[string]map[string]string)
+			for driver, count := range driverCounts {
+				divided := count / subdivisions
+				if divided == 0 {
+					divided = 1 // shared devices get count=1 per partition
+					// For shared devices, compute capacity per partition
+					// by dividing total capacity by number of subdivisions
+					for _, d := range devices {
+						if baseDriverName(d.DriverName) == driver && len(d.Capacity) > 0 {
+							capPerPartition := make(map[string]string)
+							for capName, capVal := range d.Capacity {
+								divided := divideQuantity(capVal, subdivisions)
+								if divided != "" {
+									capPerPartition[capName] = divided
+								}
+							}
+							if len(capPerPartition) > 0 {
+								p.DeviceCapacity[driver] = capPerPartition
+							}
+							break // use first device's capacity as representative
+						}
+					}
+				}
+				p.DeviceCounts[driver] = divided
+			}
+
+			// Use a subset of devices as representative
+			p.Devices = devices // all same-NUMA devices for attribute lookup
+
+			partitions = append(partitions, p)
+			partIdx++
+		}
 	}
 
 	return partitions
@@ -400,4 +529,21 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// divideQuantity divides a Kubernetes quantity string by a divisor.
+// Returns the divided quantity as a string, or empty string on failure.
+func divideQuantity(qty string, divisor int) string {
+	q, err := resource.ParseQuantity(qty)
+	if err != nil {
+		klog.V(4).Infof("Failed to parse quantity %q: %v", qty, err)
+		return ""
+	}
+	val := q.Value()
+	divided := val / int64(divisor)
+	if divided <= 0 {
+		return ""
+	}
+	result := resource.NewQuantity(divided, q.Format)
+	return result.String()
 }
