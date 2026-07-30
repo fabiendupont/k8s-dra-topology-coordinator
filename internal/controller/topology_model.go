@@ -62,6 +62,11 @@ type TopologyDevice struct {
 	// Capacity holds consumable capacity from the ResourceSlice device.
 	// Key is the capacity name, value is the total quantity string.
 	Capacity map[string]string
+
+	// ConsumesCounters records which shared counter sets this device draws from.
+	// Devices referencing the same CounterSet are overlapping partitions of the
+	// same physical resource (KEP-4815 partitionable devices).
+	ConsumesCounters []resourcev1.DeviceCounterConsumption
 }
 
 // DeviceAttributeValue holds a typed attribute value.
@@ -232,6 +237,11 @@ func (m *TopologyModel) applySliceDataLocked(raw rawSliceData) {
 			for capName, capSpec := range device.Capacity {
 				td.Capacity[string(capName)] = capSpec.Value.String()
 			}
+		}
+		// Extract counter consumption for KEP-4815 partitionable devices
+		if len(device.ConsumesCounters) > 0 {
+			td.ConsumesCounters = make([]resourcev1.DeviceCounterConsumption, len(device.ConsumesCounters))
+			copy(td.ConsumesCounters, device.ConsumesCounters)
 		}
 		devices = append(devices, td)
 	}
