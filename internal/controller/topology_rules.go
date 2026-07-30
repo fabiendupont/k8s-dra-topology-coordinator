@@ -170,6 +170,9 @@ func (s *TopologyRuleStore) GetGroupingRules() []TopologyRule {
 }
 
 // GetMatchConstraintRules returns only rules with ConstraintMatch mode.
+// GetMatchConstraintRules returns only rules with ConstraintMatch mode.
+// If no explicit pcieRoot match rule exists, a built-in default is appended
+// that aligns devices by resource.kubernetes.io/pcieRoot with numaNode fallback.
 func (s *TopologyRuleStore) GetMatchConstraintRules() []TopologyRule {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -178,6 +181,23 @@ func (s *TopologyRuleStore) GetMatchConstraintRules() []TopologyRule {
 		if rule.Constraint == ConstraintMatch {
 			result = append(result, rule)
 		}
+	}
+	hasPCIeRoot := false
+	for _, rule := range result {
+		if rule.Attribute == AttrPCIeRoot {
+			hasPCIeRoot = true
+			break
+		}
+	}
+	if !hasPCIeRoot {
+		result = append(result, TopologyRule{
+			Name:              "builtin-pcieroot-default",
+			Attribute:         AttrPCIeRoot,
+			Type:              "string",
+			Constraint:        ConstraintMatch,
+			Enforcement:       EnforcementRequired,
+			FallbackAttribute: AttrNUMANode,
+		})
 	}
 	return result
 }
