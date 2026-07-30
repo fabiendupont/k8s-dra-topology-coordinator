@@ -350,12 +350,12 @@ func TestTopologyRuleStore_LoadFromConfigMap_InvalidEnforcement(t *testing.T) {
 
 func TestBuildNUMACELSelector_SingleValue(t *testing.T) {
 	cel := BuildNUMACELSelector("gpu.amd.com/numaNode", []int64{0})
-	assert.Equal(t, `device.attributes["gpu.amd.com"].numaNode == 0`, cel)
+	assert.Equal(t, `has(device.attributes["gpu.amd.com"].numaNode) && device.attributes["gpu.amd.com"].numaNode == 0`, cel)
 }
 
 func TestBuildNUMACELSelector_MultipleValues(t *testing.T) {
 	cel := BuildNUMACELSelector("dra.cpu/numaNodeID", []int64{0, 1})
-	assert.Equal(t, `device.attributes["dra.cpu"].numaNodeID == 0 || device.attributes["dra.cpu"].numaNodeID == 1`, cel)
+	assert.Equal(t, `has(device.attributes["dra.cpu"].numaNodeID) && (device.attributes["dra.cpu"].numaNodeID == 0 || device.attributes["dra.cpu"].numaNodeID == 1)`, cel)
 }
 
 func TestBuildNUMACELSelector_InvalidAttribute(t *testing.T) {

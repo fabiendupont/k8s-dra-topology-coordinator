@@ -103,10 +103,10 @@ func TestTopologyModel_MultipleDrivers(t *testing.T) {
 	allDevices := nodeTopo.AllDevices()
 	assert.Len(t, allDevices, 4, "should have 2 GPUs + 2 NICs")
 
-	gpuDevices := nodeTopo.DevicesForDriver("gpu.nvidia.com/gpu-pool")
+	gpuDevices := nodeTopo.DevicesForDriver("gpu.nvidia.com")
 	assert.Len(t, gpuDevices, 2)
 
-	nicDevices := nodeTopo.DevicesForDriver("rdma.mellanox.com/nic-pool")
+	nicDevices := nodeTopo.DevicesForDriver("rdma.mellanox.com")
 	assert.Len(t, nicDevices, 2)
 }
 

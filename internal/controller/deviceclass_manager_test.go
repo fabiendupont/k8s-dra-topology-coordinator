@@ -132,7 +132,7 @@ func TestDeviceClassManager_DeviceClassContents(t *testing.T) {
 
 	// NUMA alignment is now handled by per-driver CEL selectors, not matchAttribute.
 	// This partition has no NUMANodes set, so sub-resources should have fallback
-	// CEL selectors using the standard dra.net/numaNode attribute.
+	// CEL selectors using the standard resource.kubernetes.io/numaNode attribute.
 	// No NUMA matchAttribute alignment should exist.
 	for _, a := range config.Alignments {
 		if a.Attribute == AttrNUMANode {
@@ -213,7 +213,7 @@ func TestDeviceClassManager_MixedPCIAndNonPCIDrivers(t *testing.T) {
 		}
 	}
 
-	// Each sub-resource should have a fallback NUMA CEL selector using dra.net/numaNode
+	// Each sub-resource should have a fallback NUMA CEL selector using resource.kubernetes.io/numaNode
 	// (no topology rules configured, so fallback to standard attribute)
 	for _, sr := range config.SubResources {
 		assert.NotEmpty(t, sr.Selectors,
@@ -397,12 +397,12 @@ func TestDeviceClassManager_PerDriverCELSelectors(t *testing.T) {
 	// GPU should use gpu.amd.com/numaNode
 	gpuSelectors := selectorMap["gpu.amd.com"]
 	require.Len(t, gpuSelectors, 1)
-	assert.Equal(t, `device.attributes["gpu.amd.com"].numaNode == 0`, gpuSelectors[0])
+	assert.Equal(t, `has(device.attributes["gpu.amd.com"].numaNode) && device.attributes["gpu.amd.com"].numaNode == 0`, gpuSelectors[0])
 
 	// CPU should use dra.cpu/numaNodeID
 	cpuSelectors := selectorMap["dra.cpu"]
 	require.Len(t, cpuSelectors, 1)
-	assert.Equal(t, `device.attributes["dra.cpu"].numaNodeID == 0`, cpuSelectors[0])
+	assert.Equal(t, `has(device.attributes["dra.cpu"].numaNodeID) && device.attributes["dra.cpu"].numaNodeID == 0`, cpuSelectors[0])
 
 	// No NUMA matchAttribute alignment should exist
 	for _, a := range config.Alignments {

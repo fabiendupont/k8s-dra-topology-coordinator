@@ -10,12 +10,34 @@ import (
 	klog "k8s.io/klog/v2"
 )
 
-// Standard topology attribute qualified names that all participating DRA drivers must publish.
+// Standard topology attribute qualified names.
 const (
-	AttrNUMANode = "dra.net/numaNode"
+	AttrNUMANode = "resource.kubernetes.io/numaNode"
 	AttrPCIeRoot = "resource.kubernetes.io/pcieRoot"
 	AttrSocket   = "nodepartition.dra.k8s.io/socket"
 )
+
+// numaNodeAliases lists all known NUMA attribute names published by DRA
+// drivers. The coordinator checks each of these when extracting NUMA
+// topology from device attributes. The first match wins (standard name
+// is checked first via AttrNUMANode above).
+var socketAliases = []string{
+	"resource.kubernetes.io/cpuSocketID",
+	"dra.cpu/cpuSocketID",
+	"dra.memory/cpuSocketID",
+	"cpuSocketID",
+	"socket",
+}
+
+var numaNodeAliases = []string{
+	"nodepartition.dra.k8s.io/numaNode",
+	"dra.net/numaNode",
+	"dra.cpu/numaNodeID",
+	"dra.memory/numaNode",
+	"dra.nvme/numaNode",
+	"numaNode",
+	"numa",
+}
 
 // TopologyDevice represents a single device from a DRA driver's ResourceSlice,
 // enriched with its topology attributes.
@@ -81,12 +103,21 @@ func (nt *NodeTopology) AllDevices() []TopologyDevice {
 
 // DevicesForDriver returns devices published by a specific driver on this node.
 func (nt *NodeTopology) DevicesForDriver(driverName string) []TopologyDevice {
-	return nt.DevicesByDriver[driverName]
+	var result []TopologyDevice
+	for _, devices := range nt.DevicesByDriver {
+		for _, d := range devices {
+			if d.DriverName == driverName {
+				result = append(result, d)
+			}
+		}
+	}
+	return result
 }
 
 // rawSliceData holds the raw information from a ResourceSlice needed
 // for re-extraction when topology rules change.
 type rawSliceData struct {
+	SliceName  string
 	DriverName string
 	NodeName   string
 	PoolName   string
@@ -168,12 +199,14 @@ func (m *TopologyModel) UpdateFromResourceSlice(slice *resourcev1.ResourceSlice)
 
 	// Store a deep copy of raw data for re-extraction when rules change.
 	// The informer cache may reuse the slice object, so we must not hold references.
-	rawKey := nodeName + "/" + driverName + "/" + poolName
+	// Key by slice name (not driver/pool) because multiple slices can share a pool.
+	rawKey := slice.Name
 	devicesCopy := make([]resourcev1.Device, len(slice.Spec.Devices))
 	for i, d := range slice.Spec.Devices {
 		devicesCopy[i] = *d.DeepCopy()
 	}
 	m.rawSlices[rawKey] = rawSliceData{
+		SliceName:  slice.Name,
 		DriverName: driverName,
 		NodeName:   nodeName,
 		PoolName:   poolName,
@@ -212,8 +245,7 @@ func (m *TopologyModel) applySliceDataLocked(raw rawSliceData) {
 		m.nodes[raw.NodeName] = nt
 	}
 
-	sliceKey := raw.DriverName + "/" + raw.PoolName
-	nt.DevicesByDriver[sliceKey] = devices
+	nt.DevicesByDriver[raw.SliceName] = devices
 }
 
 // RemoveResourceSlice removes devices from a ResourceSlice that was deleted.
@@ -222,7 +254,6 @@ func (m *TopologyModel) RemoveResourceSlice(slice *resourcev1.ResourceSlice) {
 		return
 	}
 
-	driverName := slice.Spec.Driver
 	nodeName := ""
 	if slice.Spec.NodeName != nil {
 		nodeName = *slice.Spec.NodeName
@@ -231,29 +262,25 @@ func (m *TopologyModel) RemoveResourceSlice(slice *resourcev1.ResourceSlice) {
 		return
 	}
 
-	poolName := slice.Spec.Pool.Name
-	sliceKey := driverName + "/" + poolName
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Remove raw data
-	rawKey := nodeName + "/" + driverName + "/" + poolName
-	delete(m.rawSlices, rawKey)
+	delete(m.rawSlices, slice.Name)
 
 	nt, ok := m.nodes[nodeName]
 	if !ok {
 		return
 	}
 
-	delete(nt.DevicesByDriver, sliceKey)
+	delete(nt.DevicesByDriver, slice.Name)
 
 	// Clean up empty nodes
 	if len(nt.DevicesByDriver) == 0 {
 		delete(m.nodes, nodeName)
 	}
 
-	klog.V(4).Infof("Removed from topology model: node=%s driver=%s pool=%s", nodeName, driverName, poolName)
+	klog.V(4).Infof("Removed from topology model: node=%s slice=%s", nodeName, slice.Name)
 }
 
 // GetNodeTopology returns a deep copy of the topology for a specific node.
@@ -436,6 +463,26 @@ func (m *TopologyModel) extractTopologyDevice(
 				td.Socket = attr.IntValue
 			}
 			continue
+		}
+
+		// Check NUMA node aliases — only set if not already found
+		if td.NUMANode == nil {
+			for _, alias := range numaNodeAliases {
+				if name == alias && attr.IntValue != nil {
+					td.NUMANode = attr.IntValue
+					break
+				}
+			}
+		}
+
+		// Check socket aliases — only set if not already found
+		if td.Socket == nil {
+			for _, alias := range socketAliases {
+				if name == alias && attr.IntValue != nil {
+					td.Socket = attr.IntValue
+					break
+				}
+			}
 		}
 
 		// Check topology rules for driver-specific attribute mappings

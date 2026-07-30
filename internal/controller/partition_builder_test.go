@@ -71,10 +71,9 @@ func TestPartitionBuilder_HGXScenario(t *testing.T) {
 		counts[p.Type]++
 	}
 
-	// With 4 NUMA nodes × 2 PCIe roots each: buildProportionalPartitions
-	// creates 2 partitions per NUMA = 8 total for both eighth and quarter
+	// Successive bisection: socket(2) → half, NUMA(4) → quarter, PCIe root → eighth
 	assert.Equal(t, 8, counts[PartitionEighth], "expected 8 eighth-partitions (2 per NUMA × 4 NUMA nodes)")
-	assert.Equal(t, 8, counts[PartitionQuarter], "expected 8 quarter-partitions (2 per NUMA × 4 NUMA nodes)")
+	assert.Equal(t, 4, counts[PartitionQuarter], "expected 4 quarter-partitions (one per NUMA node)")
 
 	// With 2 sockets: should get 2 half-partitions
 	assert.Equal(t, 2, counts[PartitionHalf], "expected 2 half-partitions (one per socket)")
@@ -118,15 +117,15 @@ func TestPartitionBuilder_QuarterPartitionContents(t *testing.T) {
 	results := builder.BuildPartitions()
 	require.Len(t, results, 1)
 
-	// Each quarter-partition should have proportional device counts (1 GPU + 1 NIC)
+	// Quarter = one NUMA node: 2 GPUs + 2 NICs = 4 device counts
 	for _, p := range results[0].Partitions {
 		if p.Type == PartitionQuarter {
 			totalDevices := 0
 			for _, count := range p.DeviceCounts {
 				totalDevices += count
 			}
-			assert.Equal(t, 2, totalDevices,
-				"quarter partition %s should have 2 device counts (1 GPU + 1 NIC)", p.Name)
+			assert.Equal(t, 4, totalDevices,
+				"quarter partition %s should have 4 device counts (2 GPU + 2 NIC)", p.Name)
 			assert.Len(t, p.NUMANodes, 1, "quarter partition should have exactly 1 NUMA node")
 		}
 	}

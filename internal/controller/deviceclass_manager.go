@@ -95,6 +95,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		representative PartitionDevice
 		cachedConfig   PartitionConfig
 		cachedCoupling CouplingLevel
+		count          int
 	}
 
 	seen := make(map[string]*profilePartition)
@@ -109,13 +110,16 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 			if coupling != CouplingNone {
 				key += "-" + string(coupling)
 			}
-			if _, ok := seen[key]; !ok {
+			if pp, ok := seen[key]; ok {
+				pp.count++
+			} else {
 				seen[key] = &profilePartition{
 					profile:        result.Profile,
 					partType:       partition.Type,
 					representative: partition,
 					cachedConfig:   config,
 					cachedCoupling: coupling,
+					count:          1,
 				}
 			}
 		}
@@ -123,7 +127,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 
 	// Create/update a DeviceClass for each profile+partitionType
 	for _, pp := range seen {
-		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, pp.cachedCoupling)
+		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, pp.cachedCoupling, pp.count)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
 		}
@@ -178,7 +182,7 @@ func (m *DeviceClassManager) cleanupStaleDeviceClasses(ctx context.Context, acti
 }
 
 // buildDeviceClassFromCache constructs a DeviceClass using pre-computed config and coupling.
-func (m *DeviceClassManager) buildDeviceClassFromCache(profile string, partType PartitionType, representative PartitionDevice, config PartitionConfig, coupling CouplingLevel) *resourcev1.DeviceClass {
+func (m *DeviceClassManager) buildDeviceClassFromCache(profile string, partType PartitionType, representative PartitionDevice, config PartitionConfig, coupling CouplingLevel, count int) *resourcev1.DeviceClass {
 	nameSuffix := ""
 	if len(representative.NUMANodes) > 0 && partType != PartitionFull {
 		nameSuffix = numaKeySuffix(representative.NUMANodes)
@@ -210,6 +214,9 @@ func (m *DeviceClassManager) buildDeviceClassFromCache(profile string, partType 
 	}
 	if coupling != CouplingNone {
 		labels[CoordinatorDriverName+"/coupling"] = string(coupling)
+	}
+	if count > 1 {
+		labels[CoordinatorDriverName+"/count"] = fmt.Sprintf("%d", count)
 	}
 
 	return &resourcev1.DeviceClass{
@@ -275,7 +282,7 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 					sr.Selectors = append(sr.Selectors, cel)
 				}
 			} else {
-				// Fallback: driver publishes the standard dra.net/numaNode directly
+				// Fallback: driver publishes the standard resource.kubernetes.io/numaNode directly
 				cel := BuildNUMACELSelector(AttrNUMANode, representative.NUMANodes)
 				if cel != "" {
 					sr.Selectors = append(sr.Selectors, cel)
