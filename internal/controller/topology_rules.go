@@ -79,6 +79,12 @@ type TopologyRule struct {
 	// "required" (default) always emits the constraint.
 	// "preferred" only emits the constraint when satisfiable.
 	Enforcement EnforcementMode
+	// FallbackAttribute specifies a looser attribute to use when the primary
+	// constraint is unsatisfiable for a specific partition. For example, if
+	// Attribute is pcieRoot and FallbackAttribute is "numaNode", partitions
+	// where pcieRoot alignment is impossible fall back to numaNode alignment
+	// (via per-driver CEL selectors already in place).
+	FallbackAttribute string
 	// Description is a human-readable description of the attribute.
 	Description string
 }
@@ -117,8 +123,8 @@ func (s *TopologyRuleStore) LoadFromConfigMap(cm *corev1.ConfigMap) error {
 	defer s.mu.Unlock()
 	s.rules[cm.Namespace+"/"+cm.Name] = rule
 
-	klog.Infof("Loaded topology rule %q: attribute=%s driver=%s mapsTo=%s partitioning=%s constraint=%s enforcement=%s",
-		rule.Name, rule.Attribute, rule.Driver, rule.MapsTo, rule.Partitioning, rule.Constraint, rule.Enforcement)
+	klog.Infof("Loaded topology rule %q: attribute=%s driver=%s mapsTo=%s partitioning=%s constraint=%s enforcement=%s fallback=%s",
+		rule.Name, rule.Attribute, rule.Driver, rule.MapsTo, rule.Partitioning, rule.Constraint, rule.Enforcement, rule.FallbackAttribute)
 	return nil
 }
 
@@ -287,6 +293,8 @@ func parseTopologyRule(cm *corev1.ConfigMap) (TopologyRule, error) {
 	default:
 		return rule, fmt.Errorf("invalid enforcement mode %q: must be required or preferred", enforcement)
 	}
+
+	rule.FallbackAttribute = cm.Data["fallbackAttribute"]
 
 	rule.Description = cm.Data["description"]
 

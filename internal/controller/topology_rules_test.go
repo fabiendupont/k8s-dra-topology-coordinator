@@ -396,3 +396,40 @@ func TestTopologyRuleStore_LoadFromConfigMap_InvalidMapsTo(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid mapsTo")
 }
+
+func TestTopologyRuleStore_FallbackAttribute(t *testing.T) {
+	store := NewTopologyRuleStore()
+
+	cm := makeTopologyRuleConfigMap("pcie-fallback", "default", map[string]string{
+		"attribute":         "resource.kubernetes.io/pcieRoot",
+		"type":              "string",
+		"driver":            "gpu.nvidia.com",
+		"constraint":        "match",
+		"fallbackAttribute": "numaNode",
+	})
+
+	err := store.LoadFromConfigMap(cm)
+	require.NoError(t, err)
+
+	rules := store.GetRules()
+	require.Len(t, rules, 1)
+	assert.Equal(t, "numaNode", rules[0].FallbackAttribute)
+}
+
+func TestTopologyRuleStore_FallbackAttributeEmpty(t *testing.T) {
+	store := NewTopologyRuleStore()
+
+	cm := makeTopologyRuleConfigMap("no-fallback", "default", map[string]string{
+		"attribute":  "gpu.nvidia.com/nvlinkDomain",
+		"type":       "int",
+		"driver":     "gpu.nvidia.com",
+		"constraint": "match",
+	})
+
+	err := store.LoadFromConfigMap(cm)
+	require.NoError(t, err)
+
+	rules := store.GetRules()
+	require.Len(t, rules, 1)
+	assert.Equal(t, "", rules[0].FallbackAttribute)
+}

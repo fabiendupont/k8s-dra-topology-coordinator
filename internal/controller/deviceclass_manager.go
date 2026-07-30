@@ -22,6 +22,18 @@ const (
 	CoordinatorDriverName = "nodepartition.dra.k8s.io"
 )
 
+// CouplingLevel indicates the topology tightness of a partition's constraints.
+type CouplingLevel string
+
+const (
+	// CouplingTight means the partition's devices share a PCIe root (same switch).
+	CouplingTight CouplingLevel = "tight"
+	// CouplingLoose means the partition's devices share a NUMA node but not a PCIe root.
+	CouplingLoose CouplingLevel = "loose"
+	// CouplingNone means no cross-driver coupling constraint was applied.
+	CouplingNone CouplingLevel = ""
+)
+
 // PartitionConfig is the opaque configuration embedded in DeviceClass config.
 // It tells the webhook how to expand a partition claim into sub-resource requests.
 type PartitionConfig struct {
@@ -75,30 +87,35 @@ func NewDeviceClassManager(client kubernetes.Interface, driverName string, rules
 // SyncDeviceClasses creates or updates DeviceClass objects for each partition type
 // discovered across all nodes.
 func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []PartitionResult) error {
-	// Collect all unique partition types and their profiles
+	// Collect all unique partition types and their profiles.
+	// Cache the partition config to avoid computing it twice (once for key, once for DeviceClass).
 	type profilePartition struct {
-		profile  string
-		partType PartitionType
-		// Representative partition for computing sub-resource counts
+		profile        string
+		partType       PartitionType
 		representative PartitionDevice
+		cachedConfig   PartitionConfig
+		cachedCoupling CouplingLevel
 	}
 
 	seen := make(map[string]*profilePartition)
 	for _, result := range results {
 		for _, partition := range result.Partitions {
-			// Include NUMA info in key for NUMA-specific partitions.
-			// This creates separate DeviceClasses per NUMA node (e.g.,
-			// quarter-numa0, quarter-numa1) so each can have per-driver
-			// CEL selectors using driver-specific attribute names.
+			// Compute partition config and coupling level once.
+			config, coupling := m.buildPartitionConfig(partition.Type, partition)
 			key := truncateLabel(result.Profile) + "-" + string(partition.Type)
 			if len(partition.NUMANodes) > 0 && partition.Type != PartitionFull {
 				key += numaKeySuffix(partition.NUMANodes)
+			}
+			if coupling != CouplingNone {
+				key += "-" + string(coupling)
 			}
 			if _, ok := seen[key]; !ok {
 				seen[key] = &profilePartition{
 					profile:        result.Profile,
 					partType:       partition.Type,
 					representative: partition,
+					cachedConfig:   config,
+					cachedCoupling: coupling,
 				}
 			}
 		}
@@ -106,7 +123,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 
 	// Create/update a DeviceClass for each profile+partitionType
 	for _, pp := range seen {
-		dc := m.buildDeviceClass(pp.profile, pp.partType, pp.representative)
+		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, pp.cachedCoupling)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
 		}
@@ -139,9 +156,13 @@ func (m *DeviceClassManager) cleanupStaleDeviceClasses(ctx context.Context, acti
 		profile := dc.Labels[CoordinatorDriverName+"/profile"]
 		partType := dc.Labels[CoordinatorDriverName+"/partitionType"]
 		numa := dc.Labels[CoordinatorDriverName+"/numa"]
+		coupling := dc.Labels[CoordinatorDriverName+"/coupling"]
 		key := profile + "-" + partType
 		if numa != "" {
 			key += "-" + numa
+		}
+		if coupling != "" {
+			key += "-" + coupling
 		}
 		if _, exists := active[key]; !exists {
 			if err := m.client.ResourceV1().DeviceClasses().Delete(ctx, dc.Name, metav1.DeleteOptions{}); err != nil {
@@ -156,22 +177,23 @@ func (m *DeviceClassManager) cleanupStaleDeviceClasses(ctx context.Context, acti
 	return nil
 }
 
-// buildDeviceClass constructs a DeviceClass for a given profile and partition type.
-func (m *DeviceClassManager) buildDeviceClass(profile string, partType PartitionType, representative PartitionDevice) *resourcev1.DeviceClass {
+// buildDeviceClassFromCache constructs a DeviceClass using pre-computed config and coupling.
+func (m *DeviceClassManager) buildDeviceClassFromCache(profile string, partType PartitionType, representative PartitionDevice, config PartitionConfig, coupling CouplingLevel) *resourcev1.DeviceClass {
 	nameSuffix := ""
 	if len(representative.NUMANodes) > 0 && partType != PartitionFull {
 		nameSuffix = numaKeySuffix(representative.NUMANodes)
 	}
+
 	name := m.deviceClassName(profile, partType) + nameSuffix
+	if coupling != CouplingNone {
+		name += "-" + string(coupling)
+	}
 
 	// Build the CEL selector
 	celExpr := fmt.Sprintf(
 		`device.driver == %q && device.attributes[%q].partitionType == %q`,
 		m.driverName, m.driverName, string(partType),
 	)
-
-	// Build the opaque config with sub-resource definitions
-	config := m.buildPartitionConfig(partType, representative)
 	configJSON, err := json.Marshal(config)
 	if err != nil {
 		klog.Errorf("Failed to marshal partition config: %v", err)
@@ -185,6 +207,9 @@ func (m *DeviceClassManager) buildDeviceClass(profile string, partType Partition
 	}
 	if nameSuffix != "" {
 		labels[CoordinatorDriverName+"/numa"] = strings.TrimPrefix(nameSuffix, "-")
+	}
+	if coupling != CouplingNone {
+		labels[CoordinatorDriverName+"/coupling"] = string(coupling)
 	}
 
 	return &resourcev1.DeviceClass{
@@ -215,7 +240,7 @@ func (m *DeviceClassManager) buildDeviceClass(profile string, partType Partition
 }
 
 // buildPartitionConfig builds the opaque PartitionConfig from the representative partition.
-func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representative PartitionDevice) PartitionConfig {
+func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representative PartitionDevice) (PartitionConfig, CouplingLevel) {
 	config := PartitionConfig{
 		Kind: "PartitionConfig",
 	}
@@ -271,23 +296,45 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 		requestNames = append(requestNames, driver)
 	}
 
-	// PCIe root alignment is NOT added for cross-driver partitions.
-	// GPUs and NICs have different PCIe roots, so requiring them to share
-	// a PCIe root makes the constraint unsatisfiable. NUMA alignment is
-	// sufficient for cross-driver co-placement.
-	// PCIe root alignment would only be useful for multiple devices of the
-	// SAME driver type (e.g., 2 GPUs on the same PCIe switch), which is
-	// handled by the eighth partition level.
-
-	// Match constraint alignments from topology rules
+	// Match constraint alignments from topology rules with distance-based fallback.
+	// For rules with FallbackAttribute, check if the primary constraint is satisfiable
+	// for this partition's devices. If yes, emit it (tight coupling). If not, skip it
+	// and rely on the per-driver NUMA CEL selectors already generated above (loose coupling).
+	coupling := CouplingNone
 	matchRules := m.rules.GetMatchConstraintRules()
 	for _, rule := range matchRules {
-		// Only add match constraint if the representative has devices from this driver
-		if _, ok := representative.DeviceCounts[rule.Driver]; ok {
-			enforcement := rule.Enforcement
-			if enforcement == "" {
-				enforcement = EnforcementRequired
+		if _, ok := representative.DeviceCounts[rule.Driver]; !ok {
+			continue
+		}
+
+		enforcement := rule.Enforcement
+		if enforcement == "" {
+			enforcement = EnforcementRequired
+		}
+
+		if rule.FallbackAttribute != "" {
+			// Distance-based fallback: check if primary constraint is satisfiable
+			// for this specific partition's devices.
+			if isPartitionConstraintSatisfiable(representative.Devices, rule.Attribute, representative.DeviceCounts) {
+				// Build request list filtered to drivers that publish this attribute.
+				filteredRequests := filterRequestsByAttribute(representative.Devices, rule.Attribute, requestNames)
+				config.Alignments = append(config.Alignments, AlignmentConfig{
+					Attribute:   rule.Attribute,
+					Requests:    filteredRequests,
+					Enforcement: enforcement,
+				})
+				coupling = CouplingTight
+				klog.V(2).Infof("Partition %s: primary constraint %s satisfiable (tight coupling)",
+					representative.Name, rule.Attribute)
+			} else {
+				if coupling != CouplingTight {
+					coupling = CouplingLoose
+				}
+				klog.V(2).Infof("Partition %s: primary constraint %s unsatisfiable, falling back to %s (loose coupling)",
+					representative.Name, rule.Attribute, rule.FallbackAttribute)
 			}
+		} else {
+			// No fallback: emit as before
 			config.Alignments = append(config.Alignments, AlignmentConfig{
 				Attribute:   rule.Attribute,
 				Requests:    requestNames,
@@ -296,7 +343,7 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 		}
 	}
 
-	return config
+	return config, coupling
 }
 
 // deviceClassName generates a deterministic DeviceClass name.
@@ -357,6 +404,69 @@ func numaKeySuffix(numaNodes []int64) string {
 		s += fmt.Sprintf("-%d", n)
 	}
 	return s
+}
+
+// filterRequestsByAttribute returns the subset of request names whose drivers
+// actually publish the given attribute. This prevents including non-PCI drivers
+// (CPU, memory) in pcieRoot constraints.
+func filterRequestsByAttribute(devices []TopologyDevice, attribute string, allRequests []string) []string {
+	driversWithAttr := make(map[string]bool)
+	for _, dev := range devices {
+		if deviceAttributeValueString(dev, attribute) != "" {
+			driversWithAttr[baseDriverName(dev.DriverName)] = true
+		}
+	}
+	var filtered []string
+	for _, req := range allRequests {
+		if req == "partition" || driversWithAttr[baseDriverName(req)] {
+			filtered = append(filtered, req)
+		}
+	}
+	return filtered
+}
+
+// isPartitionConstraintSatisfiable checks whether a partition's devices can
+// satisfy a matchAttribute constraint. It groups the partition's devices by
+// the attribute value and checks if any group meets all driver count requirements.
+// This is a local check on the partition's Devices slice, not a cluster-wide check.
+func isPartitionConstraintSatisfiable(devices []TopologyDevice, attribute string, driverCounts map[string]int) bool {
+	groups := make(map[string]map[string]int) // attrValue → baseDriverName → count
+	driversWithAttribute := make(map[string]bool)
+
+	for _, dev := range devices {
+		val := deviceAttributeValueString(dev, attribute)
+		if val == "" {
+			continue
+		}
+		driver := baseDriverName(dev.DriverName)
+		driversWithAttribute[driver] = true
+		if groups[val] == nil {
+			groups[val] = make(map[string]int)
+		}
+		groups[val][driver]++
+	}
+
+	if len(driversWithAttribute) < 2 {
+		return false
+	}
+
+	for _, driverMap := range groups {
+		satisfied := true
+		for driver, needed := range driverCounts {
+			base := baseDriverName(driver)
+			if !driversWithAttribute[base] {
+				continue
+			}
+			if driverMap[base] < needed {
+				satisfied = false
+				break
+			}
+		}
+		if satisfied {
+			return true
+		}
+	}
+	return false
 }
 
 // publishDeviceClass creates or updates a DeviceClass.
