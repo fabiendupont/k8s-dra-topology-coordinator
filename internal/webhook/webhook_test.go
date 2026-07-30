@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	admissionv1 "k8s.io/api/admission/v1"
+	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -148,6 +150,10 @@ func TestPartitionClaimIsExpanded(t *testing.T) {
 		},
 		Alignments: []controller.AlignmentConfig{
 			{
+				Attribute: "resource.kubernetes.io/pcieRoot",
+				Requests:  []string{"gpu.nvidia.com", "rdma.mellanox.com"},
+			},
+			{
 				Attribute: controller.AttrNUMANode,
 				Requests:  []string{"gpu.nvidia.com", "rdma.mellanox.com"},
 			},
@@ -218,7 +224,6 @@ func TestPartitionClaimIsExpanded(t *testing.T) {
 
 	assert.Len(t, expandedRequests, 2, "should have 2 sub-resource requests")
 
-	// Verify request names contain the original name prefix
 	requestNames := make(map[string]bool)
 	for _, r := range expandedRequests {
 		assert.Contains(t, r.Name, "partition-")
@@ -314,27 +319,25 @@ func TestMixedClaimOnlyExpandsPartition(t *testing.T) {
 	err = json.Unmarshal(reqBytes, &expandedRequests)
 	require.NoError(t, err)
 
-	// Should have 2 requests: 1 regular (unchanged) + 1 expanded sub-resource
 	assert.Len(t, expandedRequests, 2)
 
-	// The regular request should be preserved
 	foundRegular := false
-	foundExpanded := false
+	foundGPU := false
 	for _, r := range expandedRequests {
 		if r.Name == "regular" {
 			foundRegular = true
 			require.NotNil(t, r.Exactly)
 			assert.Equal(t, "regular-class", r.Exactly.DeviceClassName)
 		}
-		if r.Name == "partition-gpu-nvidia-com" {
-			foundExpanded = true
+		if strings.Contains(r.Name, "gpu-nvidia-com") {
+			foundGPU = true
 			require.NotNil(t, r.Exactly)
 			assert.Equal(t, "gpu.nvidia.com", r.Exactly.DeviceClassName)
 			assert.Equal(t, int64(2), r.Exactly.Count)
 		}
 	}
 	assert.True(t, foundRegular, "regular request should be preserved")
-	assert.True(t, foundExpanded, "partition request should be expanded")
+	assert.True(t, foundGPU, "GPU request should be expanded")
 }
 
 func TestDeviceClassNotFoundReturnsAllow(t *testing.T) {
@@ -491,6 +494,7 @@ func TestExpandClaimDirectly(t *testing.T) {
 		assert.True(t, ok, "unexpected request name: %s", r.Name)
 		require.NotNil(t, r.Exactly)
 		assert.Equal(t, expectedClass, r.Exactly.DeviceClassName)
+		assert.Equal(t, int64(4), r.Exactly.Count)
 	}
 }
 
@@ -713,6 +717,124 @@ func makeTopologyResourceSlice(name, driver, poolName string, numaNode int64, pc
 	}
 }
 
+func TestExpandClaimCountGreaterThanOne(t *testing.T) {
+	partConfig := controller.PartitionConfig{
+		Kind: "PartitionConfig",
+		SubResources: []controller.SubResourceConfig{
+			{DeviceClass: "gpu.amd.com", Count: 1},
+			{DeviceClass: "dra.cpu", Count: 1},
+		},
+	}
+
+	partClass := makePartitionDeviceClass("eighth", partConfig)
+	client := fake.NewSimpleClientset(partClass)
+	expander := NewClaimExpander(client)
+
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-claim",
+			Namespace: "default",
+		},
+		Spec: resourcev1.ResourceClaimSpec{
+			Devices: resourcev1.DeviceClaim{
+				Requests: []resourcev1.DeviceRequest{
+					{
+						Name: "partitions",
+						Exactly: &resourcev1.ExactDeviceRequest{
+							DeviceClassName: "eighth",
+							Count:           3,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	patches, err := expander.expandClaim(context.Background(), claim)
+	require.NoError(t, err)
+	require.NotEmpty(t, patches)
+
+	var requestsPatch *jsonPatch
+	for i := range patches {
+		if patches[i].Path == "/spec/devices/requests" {
+			requestsPatch = &patches[i]
+		}
+	}
+	require.NotNil(t, requestsPatch)
+
+	reqBytes, _ := json.Marshal(requestsPatch.Value)
+	var reqs []resourcev1.DeviceRequest
+	require.NoError(t, json.Unmarshal(reqBytes, &reqs))
+
+	// 3 instances × 2 sub-resources = 6 requests
+	assert.Len(t, reqs, 6, "count=3 with 2 sub-resources should produce 6 requests")
+
+	// Verify indexed naming
+	expectedNames := []string{
+		"partitions-0-gpu-amd-com", "partitions-0-dra-cpu",
+		"partitions-1-gpu-amd-com", "partitions-1-dra-cpu",
+		"partitions-2-gpu-amd-com", "partitions-2-dra-cpu",
+	}
+	actualNames := make([]string, len(reqs))
+	for i, r := range reqs {
+		actualNames[i] = r.Name
+	}
+	assert.ElementsMatch(t, expectedNames, actualNames)
+}
+
+func TestExpandClaimCountOneUnchanged(t *testing.T) {
+	partConfig := controller.PartitionConfig{
+		Kind: "PartitionConfig",
+		SubResources: []controller.SubResourceConfig{
+			{DeviceClass: "gpu.amd.com", Count: 1},
+		},
+	}
+
+	partClass := makePartitionDeviceClass("eighth", partConfig)
+	client := fake.NewSimpleClientset(partClass)
+	expander := NewClaimExpander(client)
+
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-claim",
+			Namespace: "default",
+		},
+		Spec: resourcev1.ResourceClaimSpec{
+			Devices: resourcev1.DeviceClaim{
+				Requests: []resourcev1.DeviceRequest{
+					{
+						Name: "partition",
+						Exactly: &resourcev1.ExactDeviceRequest{
+							DeviceClassName: "eighth",
+							Count:           1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	patches, err := expander.expandClaim(context.Background(), claim)
+	require.NoError(t, err)
+	require.NotEmpty(t, patches)
+
+	var requestsPatch *jsonPatch
+	for i := range patches {
+		if patches[i].Path == "/spec/devices/requests" {
+			requestsPatch = &patches[i]
+		}
+	}
+	require.NotNil(t, requestsPatch)
+
+	reqBytes, _ := json.Marshal(requestsPatch.Value)
+	var reqs []resourcev1.DeviceRequest
+	require.NoError(t, json.Unmarshal(reqBytes, &reqs))
+
+	// count=1 should NOT add index to name
+	assert.Len(t, reqs, 1)
+	assert.Equal(t, "partition-gpu-amd-com", reqs[0].Name)
+}
+
 func TestSanitizeDeviceClassName(t *testing.T) {
 	tests := []struct {
 		input string
@@ -732,4 +854,163 @@ func TestSanitizeDeviceClassName(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestBuildVfioConfig_AMDGpu(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	expander := NewClaimExpander(client)
+
+	cfg := expander.buildVfioConfig("gpu.amd.com")
+	require.NotNil(t, cfg, "AMD GPU should get VFIO config")
+	require.NotNil(t, cfg.Opaque)
+	assert.Equal(t, "gpu.amd.com", cfg.Opaque.Driver)
+	assert.Contains(t, string(cfg.Opaque.Parameters.Raw), "VfioDeviceConfig")
+}
+
+func TestBuildVfioConfig_SriovNic(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	expander := NewClaimExpander(client)
+
+	cfg := expander.buildVfioConfig("sriovnetwork.k8snetworkplumbingwg.io")
+	require.NotNil(t, cfg, "SR-IOV NIC should get VFIO config")
+	require.NotNil(t, cfg.Opaque)
+	assert.Equal(t, "sriovnetwork.k8snetworkplumbingwg.io", cfg.Opaque.Driver)
+	assert.Contains(t, string(cfg.Opaque.Parameters.Raw), "vfio-pci")
+}
+
+func TestBuildVfioConfig_UnknownDriver(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	expander := NewClaimExpander(client)
+
+	cfg := expander.buildVfioConfig("dra.cpu")
+	assert.Nil(t, cfg, "CPU driver should not get VFIO config")
+}
+
+func TestBuildVfioConfig_RdmaDriver(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	expander := NewClaimExpander(client)
+
+	cfg := expander.buildVfioConfig("rdma.mellanox.com")
+	require.NotNil(t, cfg, "RDMA driver should get VFIO config")
+	assert.Contains(t, string(cfg.Opaque.Parameters.Raw), "vfio-pci")
+}
+
+func TestSanitizeForRequestName(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"gpu.nvidia.com", "gpu-nvidia-com"},
+		{"sriovnetwork.k8snetworkplumbingwg.io", "sriovnetwork-k8snetworkplumbingwg-io"},
+		{"dra.cpu", "dra-cpu"},
+		{"simple", "simple"},
+		{"UPPER/Case", "upper-case"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := sanitizeForRequestName(tt.input)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestHandlePodAdmission_NoClaimsPassesThrough(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	expander := NewClaimExpander(client)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "main"}},
+		},
+	}
+	podJSON, _ := json.Marshal(pod)
+
+	req := &admissionv1.AdmissionRequest{
+		UID: "test-uid",
+		Resource: metav1.GroupVersionResource{
+			Group: "", Version: "v1", Resource: "pods",
+		},
+		Operation: admissionv1.Create,
+		Object:    runtime.RawExtension{Raw: podJSON},
+		Namespace: "default",
+	}
+
+	resp := expander.handlePodAdmission(context.Background(), req)
+	assert.True(t, resp.Allowed)
+	assert.Nil(t, resp.PatchType, "pod with no claims should not be mutated")
+}
+
+func TestHandlePodAdmission_RewritesClaimReferences(t *testing.T) {
+	// Create a claim with expansion annotation
+	claimName := "test-claim"
+	expansionMapping := map[string][]string{
+		"partition": {"partition-gpu-amd-com", "partition-sriovnetwork-k8snetworkplumbingwg-io"},
+	}
+	mappingJSON, _ := json.Marshal(expansionMapping)
+
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      claimName,
+			Namespace: "default",
+			Annotations: map[string]string{
+				driverName + "/expanded-requests": string(mappingJSON),
+			},
+		},
+	}
+
+	client := fake.NewSimpleClientset(claim)
+	expander := NewClaimExpander(client)
+
+	rcName := claimName
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			ResourceClaims: []corev1.PodResourceClaim{
+				{Name: "my-partition", ResourceClaimName: &rcName},
+			},
+			Containers: []corev1.Container{
+				{
+					Name: "main",
+					Resources: corev1.ResourceRequirements{
+						Claims: []corev1.ResourceClaim{
+							{Name: "my-partition", Request: "partition"},
+						},
+					},
+				},
+			},
+		},
+	}
+	podJSON, _ := json.Marshal(pod)
+
+	req := &admissionv1.AdmissionRequest{
+		UID: "test-uid",
+		Resource: metav1.GroupVersionResource{
+			Group: "", Version: "v1", Resource: "pods",
+		},
+		Operation: admissionv1.Create,
+		Object:    runtime.RawExtension{Raw: podJSON},
+		Namespace: "default",
+	}
+
+	resp := expander.handlePodAdmission(context.Background(), req)
+	assert.True(t, resp.Allowed)
+
+	if resp.PatchType != nil {
+		assert.Equal(t, admissionv1.PatchTypeJSONPatch, *resp.PatchType)
+		assert.NotEmpty(t, resp.Patch)
+
+		var patches []jsonPatch
+		err := json.Unmarshal(resp.Patch, &patches)
+		require.NoError(t, err)
+		assert.NotEmpty(t, patches, "should have patches to rewrite claim references")
+	}
+}
+
+func TestEscapeJSONPointer(t *testing.T) {
+	assert.Equal(t, "a~1b", escapeJSONPointer("a/b"))
+	assert.Equal(t, "a~0b", escapeJSONPointer("a~b"))
+	assert.Equal(t, "simple", escapeJSONPointer("simple"))
+	assert.Equal(t, "a~0~1b", escapeJSONPointer("a~/b"))
 }
