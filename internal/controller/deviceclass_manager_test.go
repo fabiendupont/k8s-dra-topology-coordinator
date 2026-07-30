@@ -514,3 +514,260 @@ func TestDeviceClassManager_CleansUpStaleClasses(t *testing.T) {
 	assert.Len(t, classes.Items, 1, "stale half DeviceClass should be cleaned up")
 	assert.Contains(t, classes.Items[0].Name, "quarter")
 }
+
+func TestDeviceClassManager_FallbackCouplingTight(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+
+	// Add a pcieRoot match rule with numaNode fallback
+	err := rules.LoadFromConfigMap(makeTopologyRuleConfigMap("pcie-rule", "default", map[string]string{
+		"attribute":         "resource.kubernetes.io/pcieRoot",
+		"type":              "string",
+		"driver":            "gpu.nvidia.com",
+		"constraint":        "match",
+		"fallbackAttribute": "numaNode",
+	}))
+	require.NoError(t, err)
+
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	// Partition where GPU and NIC share a pcieRoot — tight coupling
+	pcieRoot := "pci0000:15"
+	results := []PartitionResult{
+		{
+			NodeName: "node-1",
+			Profile:  "test",
+			Partitions: []PartitionDevice{
+				{
+					Name:      "node-1-eighth-0",
+					Type:      PartitionEighth,
+					Profile:   "test",
+					NUMANodes: []int64{0},
+					DeviceCounts: map[string]int{
+						"gpu.nvidia.com":    1,
+						"rdma.mellanox.com": 1,
+					},
+					Devices: []TopologyDevice{
+						{DriverName: "gpu.nvidia.com", PCIeRoot: &pcieRoot},
+						{DriverName: "rdma.mellanox.com", PCIeRoot: &pcieRoot},
+					},
+				},
+			},
+		},
+	}
+
+	err = manager.SyncDeviceClasses(context.Background(), results)
+	require.NoError(t, err)
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, classes.Items, 1)
+
+	// Should have tight coupling label
+	assert.Equal(t, "tight", classes.Items[0].Labels[CoordinatorDriverName+"/coupling"])
+
+	// Should have pcieRoot matchAttribute alignment
+	var config PartitionConfig
+	err = json.Unmarshal(classes.Items[0].Spec.Config[0].Opaque.Parameters.Raw, &config)
+	require.NoError(t, err)
+
+	hasPCIeAlignment := false
+	for _, a := range config.Alignments {
+		if a.Attribute == "resource.kubernetes.io/pcieRoot" {
+			hasPCIeAlignment = true
+		}
+	}
+	assert.True(t, hasPCIeAlignment, "tight partition should have pcieRoot alignment")
+}
+
+func TestDeviceClassManager_FallbackCouplingLoose(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+
+	err := rules.LoadFromConfigMap(makeTopologyRuleConfigMap("pcie-rule", "default", map[string]string{
+		"attribute":         "resource.kubernetes.io/pcieRoot",
+		"type":              "string",
+		"driver":            "gpu.nvidia.com",
+		"constraint":        "match",
+		"fallbackAttribute": "numaNode",
+	}))
+	require.NoError(t, err)
+
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	// Partition where GPU and NIC have DIFFERENT pcieRoots — loose coupling
+	gpuRoot := "pci0000:37"
+	nicRoot := "pci0000:15"
+	results := []PartitionResult{
+		{
+			NodeName: "node-1",
+			Profile:  "test",
+			Partitions: []PartitionDevice{
+				{
+					Name:      "node-1-eighth-1",
+					Type:      PartitionEighth,
+					Profile:   "test",
+					NUMANodes: []int64{0},
+					DeviceCounts: map[string]int{
+						"gpu.nvidia.com":    1,
+						"rdma.mellanox.com": 1,
+					},
+					Devices: []TopologyDevice{
+						{DriverName: "gpu.nvidia.com", PCIeRoot: &gpuRoot},
+						{DriverName: "rdma.mellanox.com", PCIeRoot: &nicRoot},
+					},
+				},
+			},
+		},
+	}
+
+	err = manager.SyncDeviceClasses(context.Background(), results)
+	require.NoError(t, err)
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, classes.Items, 1)
+
+	// Should have loose coupling label
+	assert.Equal(t, "loose", classes.Items[0].Labels[CoordinatorDriverName+"/coupling"])
+
+	// Should NOT have pcieRoot matchAttribute alignment
+	var config PartitionConfig
+	err = json.Unmarshal(classes.Items[0].Spec.Config[0].Opaque.Parameters.Raw, &config)
+	require.NoError(t, err)
+
+	for _, a := range config.Alignments {
+		if a.Attribute == "resource.kubernetes.io/pcieRoot" {
+			t.Fatal("loose partition should NOT have pcieRoot alignment")
+		}
+	}
+}
+
+func TestDeviceClassManager_FallbackMixedCoupling(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+
+	err := rules.LoadFromConfigMap(makeTopologyRuleConfigMap("pcie-rule", "default", map[string]string{
+		"attribute":         "resource.kubernetes.io/pcieRoot",
+		"type":              "string",
+		"driver":            "gpu.nvidia.com",
+		"constraint":        "match",
+		"fallbackAttribute": "numaNode",
+	}))
+	require.NoError(t, err)
+
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	sharedRoot := "pci0000:15"
+	gpuOnlyRoot := "pci0000:37"
+	nicRoot := "pci0000:15"
+	results := []PartitionResult{
+		{
+			NodeName: "node-1",
+			Profile:  "test",
+			Partitions: []PartitionDevice{
+				{
+					Name:      "node-1-eighth-0",
+					Type:      PartitionEighth,
+					Profile:   "test",
+					NUMANodes: []int64{0},
+					DeviceCounts: map[string]int{
+						"gpu.nvidia.com":    1,
+						"rdma.mellanox.com": 1,
+					},
+					Devices: []TopologyDevice{
+						{DriverName: "gpu.nvidia.com", PCIeRoot: &sharedRoot},
+						{DriverName: "rdma.mellanox.com", PCIeRoot: &nicRoot},
+					},
+				},
+				{
+					Name:      "node-1-eighth-1",
+					Type:      PartitionEighth,
+					Profile:   "test",
+					NUMANodes: []int64{0},
+					DeviceCounts: map[string]int{
+						"gpu.nvidia.com":    1,
+						"rdma.mellanox.com": 1,
+					},
+					Devices: []TopologyDevice{
+						{DriverName: "gpu.nvidia.com", PCIeRoot: &gpuOnlyRoot},
+						{DriverName: "rdma.mellanox.com", PCIeRoot: &nicRoot},
+					},
+				},
+			},
+		},
+	}
+
+	err = manager.SyncDeviceClasses(context.Background(), results)
+	require.NoError(t, err)
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+
+	// Should have 2 DeviceClasses: one tight, one loose
+	assert.Len(t, classes.Items, 2, "mixed coupling should produce 2 DeviceClasses")
+
+	couplings := map[string]bool{}
+	for _, dc := range classes.Items {
+		couplings[dc.Labels[CoordinatorDriverName+"/coupling"]] = true
+	}
+	assert.True(t, couplings["tight"], "should have a tight DeviceClass")
+	assert.True(t, couplings["loose"], "should have a loose DeviceClass")
+}
+
+func TestDeviceClassManager_NoFallbackAttribute(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+
+	// Rule WITHOUT fallbackAttribute — should behave as before
+	err := rules.LoadFromConfigMap(makeTopologyRuleConfigMap("nvlink", "default", map[string]string{
+		"attribute":  "gpu.nvidia.com/nvlinkDomain",
+		"type":       "int",
+		"driver":     "gpu.nvidia.com",
+		"constraint": "match",
+	}))
+	require.NoError(t, err)
+
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	results := []PartitionResult{
+		{
+			NodeName: "node-1",
+			Profile:  "test",
+			Partitions: []PartitionDevice{
+				{
+					Name:    "node-1-half-0",
+					Type:    PartitionHalf,
+					Profile: "test",
+					DeviceCounts: map[string]int{
+						"gpu.nvidia.com": 4,
+					},
+				},
+			},
+		},
+	}
+
+	err = manager.SyncDeviceClasses(context.Background(), results)
+	require.NoError(t, err)
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, classes.Items, 1)
+
+	// No coupling label when no fallback
+	_, hasCoupling := classes.Items[0].Labels[CoordinatorDriverName+"/coupling"]
+	assert.False(t, hasCoupling, "should NOT have coupling label without fallbackAttribute")
+
+	// Should still have the matchAttribute alignment
+	var config PartitionConfig
+	err = json.Unmarshal(classes.Items[0].Spec.Config[0].Opaque.Parameters.Raw, &config)
+	require.NoError(t, err)
+
+	hasNVLink := false
+	for _, a := range config.Alignments {
+		if a.Attribute == "gpu.nvidia.com/nvlinkDomain" {
+			hasNVLink = true
+		}
+	}
+	assert.True(t, hasNVLink, "should have NVLink alignment without fallback")
+}
