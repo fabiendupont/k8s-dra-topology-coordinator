@@ -107,15 +107,26 @@ func (b *PartitionBuilder) buildNodePartitions(
 		return result
 	}
 
-	// Identify distinct drivers (excluding our own coordinator driver)
+	// Filter overlapping partitionable devices down to one representative
+	// per physical resource. This prevents a single GPU advertised as
+	// SPX + 2 DPX + 8 CPX (11 devices) from being counted as 11.
+	nonOverlapping, groups := GroupOverlappingDevices(allDevices)
+	effectiveDevices := make([]TopologyDevice, 0, len(nonOverlapping)+len(groups))
+	effectiveDevices = append(effectiveDevices, nonOverlapping...)
+	for _, g := range groups {
+		effectiveDevices = append(effectiveDevices, selectRepresentative(g.Devices))
+	}
+
 	driverDeviceCounts := make(map[string]int)
-	for _, d := range allDevices {
-		baseName := baseDriverName(d.DriverName)
-		driverDeviceCounts[baseName]++
+	for _, d := range nonOverlapping {
+		driverDeviceCounts[baseDriverName(d.DriverName)]++
+	}
+	for _, g := range groups {
+		driverDeviceCounts[baseDriverName(g.DriverName)] += g.MaxEffective
 	}
 
 	// Group devices by NUMA node
-	byNUMA := groupDevicesByAttribute(allDevices, func(d TopologyDevice) string {
+	byNUMA := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
 		if d.NUMANode != nil {
 			return fmt.Sprintf("%d", *d.NUMANode)
 		}
@@ -123,7 +134,7 @@ func (b *PartitionBuilder) buildNodePartitions(
 	})
 
 	// Group devices by socket
-	bySocket := groupDevicesByAttribute(allDevices, func(d TopologyDevice) string {
+	bySocket := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
 		if d.Socket != nil {
 			return fmt.Sprintf("%d", *d.Socket)
 		}
@@ -132,7 +143,7 @@ func (b *PartitionBuilder) buildNodePartitions(
 
 	// Validate grouping alignment using extended rules
 	for _, rule := range groupingRules {
-		if !b.validateGroupingAlignment(allDevices, rule) {
+		if !b.validateGroupingAlignment(effectiveDevices, rule) {
 			klog.Warningf("Node %s: devices not aligned by rule attribute %s, skipping extended grouping",
 				nodeName, rule.Attribute)
 		}
@@ -169,7 +180,7 @@ func (b *PartitionBuilder) buildNodePartitions(
 	}
 
 	if pcieTier != "" {
-		p := b.buildProportionalPartitions(nodeName, profile, pcieTier, byNUMA, allDevices)
+		p := b.buildProportionalPartitions(nodeName, profile, pcieTier, byNUMA, effectiveDevices)
 		result.Partitions = append(result.Partitions, p...)
 	}
 
@@ -183,7 +194,7 @@ func (b *PartitionBuilder) buildNodePartitions(
 		result.Partitions = append(result.Partitions, p...)
 	}
 
-	full := b.buildFullPartition(nodeName, profile, allDevices, groupingRules)
+	full := b.buildFullPartition(nodeName, profile, effectiveDevices, groupingRules)
 	if full != nil {
 		result.Partitions = append(result.Partitions, *full)
 	}
