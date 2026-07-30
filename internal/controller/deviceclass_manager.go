@@ -256,7 +256,7 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 	// and per-driver CEL selectors for NUMA pinning.
 	for driver, count := range representative.DeviceCounts {
 		sr := SubResourceConfig{
-			DeviceClass: driver,
+			DeviceClass: m.rules.GetDeviceClassForDriver(driver),
 			Count:       count,
 		}
 		if representative.DeviceCapacity != nil {

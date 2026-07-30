@@ -85,6 +85,12 @@ type TopologyRule struct {
 	// where pcieRoot alignment is impossible fall back to numaNode alignment
 	// (via per-driver CEL selectors already in place).
 	FallbackAttribute string
+	// DeviceClass overrides the DeviceClass name used in partition sub-resources
+	// for this driver. By default the driver name is used, but some drivers
+	// publish multiple device types under one driver name with separate
+	// DeviceClasses (e.g., gpu.nvidia.com publishes "gpu" and "vfio" types
+	// with DeviceClasses "gpu.nvidia.com" and "vfio.gpu.nvidia.com").
+	DeviceClass string
 	// Description is a human-readable description of the attribute.
 	Description string
 }
@@ -123,8 +129,8 @@ func (s *TopologyRuleStore) LoadFromConfigMap(cm *corev1.ConfigMap) error {
 	defer s.mu.Unlock()
 	s.rules[cm.Namespace+"/"+cm.Name] = rule
 
-	klog.Infof("Loaded topology rule %q: attribute=%s driver=%s mapsTo=%s partitioning=%s constraint=%s enforcement=%s fallback=%s",
-		rule.Name, rule.Attribute, rule.Driver, rule.MapsTo, rule.Partitioning, rule.Constraint, rule.Enforcement, rule.FallbackAttribute)
+	klog.Infof("Loaded topology rule %q: attribute=%s driver=%s mapsTo=%s partitioning=%s constraint=%s enforcement=%s fallback=%s deviceClass=%s",
+		rule.Name, rule.Attribute, rule.Driver, rule.MapsTo, rule.Partitioning, rule.Constraint, rule.Enforcement, rule.FallbackAttribute, rule.DeviceClass)
 	return nil
 }
 
@@ -190,6 +196,21 @@ func (s *TopologyRuleStore) GetNUMAAttributeForDriver(driverName string) (string
 		}
 	}
 	return "", false
+}
+
+// GetDeviceClassForDriver returns the DeviceClass name to use for a driver's
+// sub-resources. If a topology rule specifies a deviceClass override, that is
+// returned. Otherwise the driver name itself is used as the DeviceClass.
+func (s *TopologyRuleStore) GetDeviceClassForDriver(driverName string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, rule := range s.rules {
+		if rule.Driver == driverName && rule.DeviceClass != "" {
+			return rule.DeviceClass
+		}
+	}
+	return driverName
 }
 
 // BuildNUMACELSelector generates a CEL expression that pins devices from a
@@ -298,6 +319,8 @@ func parseTopologyRule(cm *corev1.ConfigMap) (TopologyRule, error) {
 	}
 
 	rule.FallbackAttribute = cm.Data["fallbackAttribute"]
+
+	rule.DeviceClass = cm.Data["deviceClass"]
 
 	rule.Description = cm.Data["description"]
 
