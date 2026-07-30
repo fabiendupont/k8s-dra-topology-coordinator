@@ -209,16 +209,19 @@ func BuildNUMACELSelector(attribute string, numaValues []int64) string {
 	domain := parts[0]
 	name := parts[1]
 
+	attrRef := fmt.Sprintf(`device.attributes["%s"].%s`, domain, name)
+	hasGuard := fmt.Sprintf(`has(%s)`, attrRef)
+
 	if len(numaValues) == 1 {
-		return fmt.Sprintf(`device.attributes["%s"].%s == %d`, domain, name, numaValues[0])
+		return fmt.Sprintf(`%s && %s == %d`, hasGuard, attrRef, numaValues[0])
 	}
 
-	// Multiple NUMA values: OR expression
+	// Multiple NUMA values: has() && (v1 || v2 || ...)
 	var clauses []string
 	for _, v := range numaValues {
-		clauses = append(clauses, fmt.Sprintf(`device.attributes["%s"].%s == %d`, domain, name, v))
+		clauses = append(clauses, fmt.Sprintf(`%s == %d`, attrRef, v))
 	}
-	return strings.Join(clauses, " || ")
+	return fmt.Sprintf(`%s && (%s)`, hasGuard, strings.Join(clauses, " || "))
 }
 
 // parseTopologyRule parses a TopologyRule from a ConfigMap's data fields.
