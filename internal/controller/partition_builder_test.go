@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // buildHGXB200Topology populates a topology model with an HGX B200-like node:
@@ -71,14 +72,9 @@ func TestPartitionBuilder_HGXScenario(t *testing.T) {
 		counts[p.Type]++
 	}
 
-	// Successive bisection: socket(2) → half, NUMA(4) → quarter, PCIe root → eighth
-	assert.Equal(t, 8, counts[PartitionEighth], "expected 8 eighth-partitions (2 per NUMA × 4 NUMA nodes)")
-	assert.Equal(t, 4, counts[PartitionQuarter], "expected 4 quarter-partitions (one per NUMA node)")
-
-	// With 2 sockets: should get 2 half-partitions
-	assert.Equal(t, 2, counts[PartitionHalf], "expected 2 half-partitions (one per socket)")
-
-	// Should get 1 full partition
+	// pcieRoot/numa/full model: 8 PCIe roots, 4 NUMA nodes, 1 full
+	assert.Equal(t, 8, counts[PartitionPCIeRoot], "expected 8 pcieRoot partitions (one per PCIe root)")
+	assert.Equal(t, 4, counts[PartitionNUMA], "expected 4 NUMA partitions (one per NUMA node)")
 	assert.Equal(t, 1, counts[PartitionFull], "expected 1 full partition")
 }
 
@@ -92,22 +88,21 @@ func TestPartitionBuilder_EighthPartitionContents(t *testing.T) {
 	results := builder.BuildPartitions()
 	require.Len(t, results, 1)
 
-	// Each eighth-partition should have proportional device counts (1 GPU + 1 NIC)
-	// and a single NUMA node
+	// Each pcieRoot partition should have 1 GPU + 1 NIC and a single NUMA node
 	for _, p := range results[0].Partitions {
-		if p.Type == PartitionEighth {
+		if p.Type == PartitionPCIeRoot {
 			totalDevices := 0
 			for _, count := range p.DeviceCounts {
 				totalDevices += count
 			}
 			assert.Equal(t, 2, totalDevices,
-				"eighth partition %s should have 2 device counts (1 GPU + 1 NIC)", p.Name)
-			assert.Len(t, p.NUMANodes, 1, "eighth partition should have exactly 1 NUMA node")
+				"pcieRoot partition %s should have 2 device counts (1 GPU + 1 NIC)", p.Name)
+			assert.Len(t, p.NUMANodes, 1, "pcieRoot partition should have exactly 1 NUMA node")
 		}
 	}
 }
 
-func TestPartitionBuilder_QuarterPartitionContents(t *testing.T) {
+func TestPartitionBuilder_NUMAPartitionContents(t *testing.T) {
 	model := NewTopologyModel()
 	rules := NewTopologyRuleStore()
 	builder := NewPartitionBuilder(model, rules)
@@ -117,39 +112,16 @@ func TestPartitionBuilder_QuarterPartitionContents(t *testing.T) {
 	results := builder.BuildPartitions()
 	require.Len(t, results, 1)
 
-	// Quarter = one NUMA node: 2 GPUs + 2 NICs = 4 device counts
+	// NUMA partition = one NUMA node: 2 GPUs + 2 NICs = 4 device counts
 	for _, p := range results[0].Partitions {
-		if p.Type == PartitionQuarter {
+		if p.Type == PartitionNUMA {
 			totalDevices := 0
 			for _, count := range p.DeviceCounts {
 				totalDevices += count
 			}
 			assert.Equal(t, 4, totalDevices,
-				"quarter partition %s should have 4 device counts (2 GPU + 2 NIC)", p.Name)
-			assert.Len(t, p.NUMANodes, 1, "quarter partition should have exactly 1 NUMA node")
-		}
-	}
-}
-
-func TestPartitionBuilder_HalfPartitionContents(t *testing.T) {
-	model := NewTopologyModel()
-	rules := NewTopologyRuleStore()
-	builder := NewPartitionBuilder(model, rules)
-
-	buildHGXB200Topology(model)
-
-	results := builder.BuildPartitions()
-	require.Len(t, results, 1)
-
-	for _, p := range results[0].Partitions {
-		if p.Type == PartitionHalf {
-			totalDevices := 0
-			for _, count := range p.DeviceCounts {
-				totalDevices += count
-			}
-			assert.Equal(t, 8, totalDevices,
-				"half partition %s should contain 8 devices (4 GPU + 4 NIC)", p.Name)
-			assert.Len(t, p.Sockets, 1, "half partition should span exactly 1 socket")
+				"NUMA partition %s should have 4 device counts (2 GPU + 2 NIC)", p.Name)
+			assert.Len(t, p.NUMANodes, 1, "NUMA partition should have exactly 1 NUMA node")
 		}
 	}
 }
@@ -242,7 +214,7 @@ func TestPartitionBuilder_WithNVLinkGrouping(t *testing.T) {
 
 	// Verify that devices in each partition share the same NVLink domain
 	for _, p := range results[0].Partitions {
-		if p.Type == PartitionQuarter || p.Type == PartitionEighth {
+		if p.Type == PartitionPCIeRoot || p.Type == PartitionNUMA {
 			// All GPU devices in the partition should have the same nvlinkDomain
 			var domain *int64
 			for _, d := range p.Devices {
@@ -287,9 +259,10 @@ func TestPartitionBuilder_SingleDeviceNode(t *testing.T) {
 		counts[p.Type]++
 	}
 	assert.Equal(t, 1, counts[PartitionFull], "should have 1 full partition")
-	// Single device means single group for all topology levels, so no sub-partitions
-	assert.Equal(t, 0, counts[PartitionEighth]+counts[PartitionQuarter]+counts[PartitionHalf],
-		"should have no sub-partitions with a single device")
+	// Single device on one PCIe root produces 1 pcieRoot partition.
+	// NUMA partition is skipped (only 1 NUMA node = would duplicate full).
+	assert.Equal(t, 1, counts[PartitionPCIeRoot], "should have 1 pcieRoot partition")
+	assert.Equal(t, 0, counts[PartitionNUMA], "should have no NUMA partitions with only 1 NUMA node")
 }
 
 func TestPartitionBuilder_MultipleNodes(t *testing.T) {
@@ -343,6 +316,153 @@ func TestPartitionBuilder_TopologyRecomputation(t *testing.T) {
 	newPartitionCount := len(results[0].Partitions)
 	assert.Greater(t, newPartitionCount, initialPartitionCount,
 		"adding a device on a new NUMA node should increase partition count")
+}
+
+// buildMI355XPartitionableTopology populates a model with 2 AMD MI355X GPUs
+// on NUMA 0, each advertised as SPX + 2 DPX = 3 devices (6 total for 2 physical GPUs),
+// plus 2 NICs on NUMA 0.
+func buildMI355XPartitionableTopology(model *TopologyModel) {
+	gpuDevices := []resourcev1.Device{
+		// GPU 0: SPX + 2 DPX
+		{
+			Name: "gpu-0-spx",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-0")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-0-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(8, resource.DecimalSI)},
+				}},
+			},
+		},
+		{
+			Name: "gpu-0-dpx-0",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-0")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-0-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(4, resource.DecimalSI)},
+				}},
+			},
+		},
+		{
+			Name: "gpu-0-dpx-1",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-0")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-0-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(4, resource.DecimalSI)},
+				}},
+			},
+		},
+		// GPU 1: SPX + 2 DPX
+		{
+			Name: "gpu-1-spx",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-1")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-1-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(8, resource.DecimalSI)},
+				}},
+			},
+		},
+		{
+			Name: "gpu-1-dpx-0",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-1")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-1-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(4, resource.DecimalSI)},
+				}},
+			},
+		},
+		{
+			Name: "gpu-1-dpx-1",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-1")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-1-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(4, resource.DecimalSI)},
+				}},
+			},
+		},
+	}
+	gpuSlice := makeResourceSlice("gpu-slice", "gpu.amd.com", "node-1", "gpu-pool", gpuDevices)
+	model.UpdateFromResourceSlice(gpuSlice)
+
+	// 2 NICs on same NUMA, different PCIe roots
+	nicDevices := []resourcev1.Device{
+		makeNICDevice("nic-0", 0, "pcie-0"),
+		makeNICDevice("nic-1", 0, "pcie-1"),
+	}
+	nicSlice := makeResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", nicDevices)
+	model.UpdateFromResourceSlice(nicSlice)
+}
+
+func TestPartitionBuilder_PartitionableDevices(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+	builder := NewPartitionBuilder(model, rules)
+
+	buildMI355XPartitionableTopology(model)
+
+	results := builder.BuildPartitions()
+	require.Len(t, results, 1)
+
+	result := results[0]
+
+	// The full partition should report 2 effective GPUs, not 6
+	for _, p := range result.Partitions {
+		if p.Type == PartitionFull {
+			gpuCount := p.DeviceCounts["gpu.amd.com"]
+			assert.Equal(t, 2, gpuCount,
+				"full partition should have 2 effective GPUs (not 6 advertised)")
+			nicCount := p.DeviceCounts["rdma.mellanox.com"]
+			assert.Equal(t, 2, nicCount,
+				"full partition should have 2 NICs")
+		}
+	}
+}
+
+func TestPartitionBuilder_PartitionableDevicesEighths(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+	builder := NewPartitionBuilder(model, rules)
+
+	buildMI355XPartitionableTopology(model)
+
+	results := builder.BuildPartitions()
+	require.Len(t, results, 1)
+
+	// With 2 GPUs on 2 PCIe roots on 1 NUMA, pcieRoot partitions should
+	// each have 1 effective GPU + 1 NIC
+	for _, p := range results[0].Partitions {
+		if p.Type == PartitionPCIeRoot {
+			gpuCount := p.DeviceCounts["gpu.amd.com"]
+			assert.Equal(t, 1, gpuCount,
+				"pcieRoot partition %s should have 1 effective GPU", p.Name)
+			nicCount := p.DeviceCounts["rdma.mellanox.com"]
+			assert.Equal(t, 1, nicCount,
+				"pcieRoot partition %s should have 1 NIC", p.Name)
+		}
+	}
 }
 
 func TestBaseDriverName(t *testing.T) {

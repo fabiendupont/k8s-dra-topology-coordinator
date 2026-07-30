@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	resourcev1 "k8s.io/api/resource/v1"
@@ -56,6 +57,10 @@ type SubResourceConfig struct {
 	// each driver's devices are constrained using the driver's own attribute
 	// namespace (e.g., device.attributes["gpu.amd.com"].numaNode == 0).
 	Selectors []string `json:"selectors,omitempty"`
+	// PartitionMode indicates the DRA partition mode for this sub-resource.
+	// When set, the webhook adds a CEL selector to filter by partition type
+	// (e.g., "SPX" for full GPU, "DPX" for half, "CPX" for eighth).
+	PartitionMode string `json:"partitionMode,omitempty"`
 }
 
 // AlignmentConfig defines a matchAttribute constraint for the combined claim.
@@ -63,6 +68,22 @@ type AlignmentConfig struct {
 	Attribute   string          `json:"attribute"`
 	Requests    []string        `json:"requests"`
 	Enforcement EnforcementMode `json:"enforcement"`
+}
+
+// profilePartition tracks a unique partition instance for DeviceClass generation.
+type profilePartition struct {
+	profile        string
+	partType       PartitionType
+	representative PartitionDevice
+	cachedConfig   PartitionConfig
+	cachedCoupling CouplingLevel
+	count          int
+}
+
+// aggregateKey groups partitions by profile and type for aggregate DeviceClasses.
+type aggregateKey struct {
+	profile  string
+	partType PartitionType
 }
 
 // DeviceClassManager creates and manages DeviceClass objects based on discovered partition types.
@@ -89,15 +110,6 @@ func NewDeviceClassManager(client kubernetes.Interface, driverName string, rules
 func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []PartitionResult) error {
 	// Collect all unique partition types and their profiles.
 	// Cache the partition config to avoid computing it twice (once for key, once for DeviceClass).
-	type profilePartition struct {
-		profile        string
-		partType       PartitionType
-		representative PartitionDevice
-		cachedConfig   PartitionConfig
-		cachedCoupling CouplingLevel
-		count          int
-	}
-
 	seen := make(map[string]*profilePartition)
 	for _, result := range results {
 		for _, partition := range result.Partitions {
@@ -106,6 +118,9 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 			key := truncateLabel(result.Profile) + "-" + string(partition.Type)
 			if len(partition.NUMANodes) > 0 && partition.Type != PartitionFull {
 				key += numaKeySuffix(partition.NUMANodes)
+			}
+			if partition.Type == PartitionPCIeRoot && len(partition.PCIeRoots) > 0 {
+				key += "-" + sanitizeForName(partition.PCIeRoots[0])
 			}
 			if coupling != CouplingNone {
 				key += "-" + string(coupling)
@@ -125,11 +140,206 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		}
 	}
 
+	// Compute rail indices for pcieroot partitions based on sorted PCIe root
+	// address. Uses the first PCIeRoot from each partition's representative,
+	// matching the sort order used by the grouping builder for gpu-nic-pair.
+	type pcieRootEntry struct {
+		key      string
+		pcieRoot string
+	}
+	var pcieRootEntries []pcieRootEntry
+	for key, pp := range seen {
+		if pp.partType == PartitionPCIeRoot && len(pp.representative.PCIeRoots) > 0 {
+			pcieRootEntries = append(pcieRootEntries, pcieRootEntry{key: key, pcieRoot: pp.representative.PCIeRoots[0]})
+		}
+	}
+	sort.Slice(pcieRootEntries, func(i, j int) bool {
+		return pcieRootEntries[i].pcieRoot < pcieRootEntries[j].pcieRoot
+	})
+	pcieRootRailIndex := make(map[string]int)
+	for i, entry := range pcieRootEntries {
+		pcieRootRailIndex[entry.key] = i
+	}
+
 	// Create/update a DeviceClass for each profile+partitionType
-	for _, pp := range seen {
+	for key, pp := range seen {
 		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, pp.cachedCoupling, pp.count)
+		if pp.partType == PartitionFull {
+			dc.Name = string(PartitionFull)
+		}
+		if pp.partType == PartitionPCIeRoot {
+			if rail, ok := pcieRootRailIndex[key]; ok {
+				dc.Labels[CoordinatorDriverName+"/railIndex"] = fmt.Sprintf("%d", rail)
+				dc.Name = fmt.Sprintf("%s-rail%d", dc.Name, rail)
+			}
+		}
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
+		}
+	}
+
+	// Emit aggregate DeviceClasses per partition type (pcieroot, numa).
+	// No NUMA/PCIe selectors — the scheduler picks placement.
+	// Use intersection of device counts: only include drivers present on
+	// ALL partitions of the same type. This ensures the aggregate is
+	// schedulable on any instance. Asymmetric devices (NICs on some roots
+	// but not others) are handled via grouping DeviceClasses instead.
+	type aggregateState struct {
+		profile        string
+		partType       PartitionType
+		driverSeen     map[string]int // driver → number of partitions that have it
+		minCounts      map[string]int
+		minCap         map[string]map[string]string
+		devices        []TopologyDevice
+		partitionNUMAs []int64 // primary NUMA node of each partition
+		total          int     // total partitions of this type
+		count          int     // sum of pp.count
+	}
+	aggStates := make(map[aggregateKey]*aggregateState)
+	for _, pp := range seen {
+		if pp.partType == PartitionFull {
+			continue
+		}
+		ak := aggregateKey{profile: pp.profile, partType: pp.partType}
+		if existing, ok := aggStates[ak]; ok {
+			existing.count += pp.count
+			existing.total++
+			if len(pp.representative.NUMANodes) > 0 {
+				existing.partitionNUMAs = append(existing.partitionNUMAs, pp.representative.NUMANodes[0])
+			}
+			for driver, count := range pp.representative.DeviceCounts {
+				existing.driverSeen[driver]++
+				if prev, has := existing.minCounts[driver]; !has || count < prev {
+					existing.minCounts[driver] = count
+				}
+				if pp.representative.DeviceCapacity != nil {
+					if cap, ok := pp.representative.DeviceCapacity[driver]; ok {
+						existing.minCap[driver] = cap
+					}
+				}
+			}
+			existing.devices = append(existing.devices, pp.representative.Devices...)
+		} else {
+			driverSeen := make(map[string]int)
+			minCounts := make(map[string]int)
+			for k, v := range pp.representative.DeviceCounts {
+				driverSeen[k] = 1
+				minCounts[k] = v
+			}
+			minCap := make(map[string]map[string]string)
+			if pp.representative.DeviceCapacity != nil {
+				for k, v := range pp.representative.DeviceCapacity {
+					minCap[k] = v
+				}
+			}
+			var partNUMAs []int64
+			if len(pp.representative.NUMANodes) > 0 {
+				partNUMAs = []int64{pp.representative.NUMANodes[0]}
+			}
+			aggStates[ak] = &aggregateState{
+				profile:        pp.profile,
+				partType:       pp.partType,
+				driverSeen:     driverSeen,
+				minCounts:      minCounts,
+				minCap:         minCap,
+				devices:        append([]TopologyDevice{}, pp.representative.Devices...),
+				partitionNUMAs: partNUMAs,
+				total:          1,
+				count:          pp.count,
+			}
+		}
+	}
+	aggregates := make(map[aggregateKey]*profilePartition)
+	for ak, state := range aggStates {
+		// Intersection: keep drivers present on all partitions, or reachable
+		// to all partitions via SLIT-distance NUMANodes lists.
+		intersectedCounts := make(map[string]int)
+		intersectedCap := make(map[string]map[string]string)
+		for driver, seen := range state.driverSeen {
+			if seen == state.total {
+				intersectedCounts[driver] = state.minCounts[driver]
+				if cap, ok := state.minCap[driver]; ok {
+					intersectedCap[driver] = cap
+				}
+			} else if ak.partType == PartitionNUMA && isDriverReachableToAll(driver, state.partitionNUMAs, state.devices) {
+				// SLIT-reachable driver: divide total count by the number of
+				// NUMA nodes sharing access to get the per-partition share.
+				sharingNUMAs := countSharingNUMAs(driver, state.partitionNUMAs, state.devices)
+				count := state.minCounts[driver]
+				if sharingNUMAs > 1 {
+					count = count / sharingNUMAs
+				}
+				if count < 1 {
+					count = 1
+				}
+				intersectedCounts[driver] = count
+				if cap, ok := state.minCap[driver]; ok {
+					intersectedCap[driver] = cap
+				}
+			}
+		}
+		mergedRep := PartitionDevice{
+			Profile:        state.profile,
+			Type:           state.partType,
+			DeviceCounts:   intersectedCounts,
+			DeviceCapacity: intersectedCap,
+			Devices:        state.devices,
+		}
+		aggConfig, aggCoupling := m.buildPartitionAggregateConfig(mergedRep)
+		aggregates[ak] = &profilePartition{
+			profile:        state.profile,
+			partType:       state.partType,
+			representative: mergedRep,
+			cachedConfig:   aggConfig,
+			cachedCoupling: aggCoupling,
+			count:          state.count,
+		}
+	}
+	for _, pp := range aggregates {
+		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, CouplingNone, pp.count)
+		dc.Name = string(pp.partType)
+		if err := m.publishDeviceClass(ctx, dc); err != nil {
+			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
+		}
+	}
+
+	// Emit tier-named aggregate DeviceClasses (eighth, quarter, half, etc.)
+	// based on the fraction of total PCIe roots each partition type covers.
+	// Collect all partitions for countPCIeRootsInNUMA lookups.
+	var allPartitions []PartitionDevice
+	for _, result := range results {
+		allPartitions = append(allPartitions, result.Partitions...)
+	}
+	pcieRootCount := 0
+	for _, pp := range seen {
+		if pp.partType == PartitionPCIeRoot {
+			pcieRootCount++
+		}
+	}
+
+	// Compute tier names for partition types that map to a fraction of PCIe
+	// roots. For pcieroot partitions: 1/N of total roots. For NUMA partitions:
+	// count PCIe roots in the NUMA node / total roots (e.g., 4/8 = half).
+	tierNames := make(map[aggregateKey]string)
+	if pcieRootCount > 0 {
+		for ak, pp := range aggregates {
+			tierName := computeTierName(ak.partType, pp, allPartitions, ak.profile, pcieRootCount)
+			if tierName != "" {
+				tierNames[ak] = tierName
+			}
+		}
+	}
+
+	for ak, tierName := range tierNames {
+		pp := aggregates[ak]
+		aggRep := pp.representative
+		aggRep.NUMANodes = nil
+		aggRep.PCIeRoots = nil
+		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, aggRep, pp.cachedConfig, CouplingNone, pp.count)
+		dc.Name = tierName
+		dc.Labels[CoordinatorDriverName+"/tierName"] = tierName
+		if err := m.publishDeviceClass(ctx, dc); err != nil {
+			return fmt.Errorf("failed to publish tier DeviceClass %s: %w", dc.Name, err)
 		}
 	}
 
@@ -137,6 +347,13 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 	activeKeys := make(map[string]bool, len(seen))
 	for key := range seen {
 		activeKeys[key] = true
+	}
+	for ak := range aggregates {
+		aggKey := truncateLabel(ak.profile) + "-" + string(ak.partType)
+		activeKeys[aggKey] = true
+	}
+	for ak, tierName := range tierNames {
+		activeKeys[truncateLabel(ak.profile)+"-"+tierName] = true
 	}
 	if err := m.cleanupStaleDeviceClasses(ctx, activeKeys); err != nil {
 		klog.Errorf("Failed to cleanup stale DeviceClasses: %v", err)
@@ -146,9 +363,114 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 	return nil
 }
 
+// computeTierName returns the human-readable tier name (eighth, quarter, half, etc.)
+// for a given aggregate partition type, or "" if no well-known name applies.
+func computeTierName(partType PartitionType, pp *profilePartition, allPartitions []PartitionDevice, profile string, pcieRootCount int) string {
+	var rootsInPartition int
+	switch partType {
+	case PartitionPCIeRoot:
+		rootsInPartition = 1
+	case PartitionNUMA:
+		rootsInPartition = countPCIeRootsInNUMA(allPartitions, profile, pp.representative.NUMANodes)
+		if rootsInPartition == 0 {
+			rootsInPartition = pcieRootCount / pp.count
+		}
+	default:
+		return ""
+	}
+	tierName := fractionToTierName(rootsInPartition, pcieRootCount)
+	if tierName == "" || tierName == "full" || tierName == string(partType) {
+		return ""
+	}
+	return tierName
+}
+
+// isDriverReachableToAll checks if a driver's devices are reachable to all
+// partition NUMA nodes via SLIT-distance NUMANodes lists. A device is reachable
+// to a partition if the partition's NUMA node appears in the device's NUMANodes
+// list (indicating equidistant access, e.g., same socket).
+func isDriverReachableToAll(driver string, partitionNUMAs []int64, devices []TopologyDevice) bool {
+	if len(partitionNUMAs) == 0 {
+		return false
+	}
+	for _, partNUMA := range partitionNUMAs {
+		reachable := false
+		for _, dev := range devices {
+			if baseDriverName(dev.DriverName) != driver {
+				continue
+			}
+			for _, devNUMA := range dev.NUMANodes {
+				if devNUMA == partNUMA {
+					reachable = true
+					break
+				}
+			}
+			if reachable {
+				break
+			}
+		}
+		if !reachable {
+			return false
+		}
+	}
+	return true
+}
+
+// countSharingNUMAs returns how many partition NUMA nodes share access to a
+// driver's devices via SLIT. This is the average NUMANodes list length across
+// the driver's devices, used to divide device counts proportionally.
+func countSharingNUMAs(driver string, partitionNUMAs []int64, devices []TopologyDevice) int {
+	partSet := make(map[int64]bool, len(partitionNUMAs))
+	for _, n := range partitionNUMAs {
+		partSet[n] = true
+	}
+	maxSharing := 0
+	for _, dev := range devices {
+		if baseDriverName(dev.DriverName) != driver {
+			continue
+		}
+		sharing := 0
+		for _, n := range dev.NUMANodes {
+			if partSet[n] {
+				sharing++
+			}
+		}
+		if sharing > maxSharing {
+			maxSharing = sharing
+		}
+	}
+	return maxSharing
+}
+
+// countPCIeRootsInNUMA counts how many PCIe root partitions share NUMA nodes
+// with the given NUMA node set. Used to determine what fraction of the node
+// a NUMA partition represents.
+func countPCIeRootsInNUMA(partitions []PartitionDevice, profile string, numaNodes []int64) int {
+	if len(numaNodes) == 0 {
+		return 0
+	}
+	numaSet := make(map[int64]bool, len(numaNodes))
+	for _, n := range numaNodes {
+		numaSet[n] = true
+	}
+	count := 0
+	for _, p := range partitions {
+		if p.Profile != profile || p.Type != PartitionPCIeRoot {
+			continue
+		}
+		for _, n := range p.NUMANodes {
+			if numaSet[n] {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
 // cleanupStaleDeviceClasses removes DeviceClasses that no longer match any partition.
 func (m *DeviceClassManager) cleanupStaleDeviceClasses(ctx context.Context, active map[string]bool) error {
-	labelSelector := fmt.Sprintf("%s/managed=true", CoordinatorDriverName)
+	labelSelector := fmt.Sprintf("%s/managed=true,%s/partitionType", CoordinatorDriverName, CoordinatorDriverName)
 	classes, err := m.client.ResourceV1().DeviceClasses().List(ctx, metav1.ListOptions{
 		LabelSelector: labelSelector,
 	})
@@ -159,14 +481,23 @@ func (m *DeviceClassManager) cleanupStaleDeviceClasses(ctx context.Context, acti
 	for _, dc := range classes.Items {
 		profile := dc.Labels[CoordinatorDriverName+"/profile"]
 		partType := dc.Labels[CoordinatorDriverName+"/partitionType"]
+		tierName := dc.Labels[CoordinatorDriverName+"/tierName"]
 		numa := dc.Labels[CoordinatorDriverName+"/numa"]
 		coupling := dc.Labels[CoordinatorDriverName+"/coupling"]
-		key := profile + "-" + partType
-		if numa != "" {
-			key += "-" + numa
-		}
-		if coupling != "" {
-			key += "-" + coupling
+
+		// Tier-named aggregates use profile-tierName as their key;
+		// regular partitions use profile-partitionType[-numa][-coupling].
+		var key string
+		if tierName != "" {
+			key = profile + "-" + tierName
+		} else {
+			key = profile + "-" + partType
+			if numa != "" {
+				key += "-" + numa
+			}
+			if coupling != "" {
+				key += "-" + coupling
+			}
 		}
 		if _, exists := active[key]; !exists {
 			if err := m.client.ResourceV1().DeviceClasses().Delete(ctx, dc.Name, metav1.DeleteOptions{}); err != nil {
@@ -186,6 +517,9 @@ func (m *DeviceClassManager) buildDeviceClassFromCache(profile string, partType 
 	nameSuffix := ""
 	if len(representative.NUMANodes) > 0 && partType != PartitionFull {
 		nameSuffix = numaKeySuffix(representative.NUMANodes)
+	}
+	if partType == PartitionPCIeRoot && len(representative.PCIeRoots) > 0 {
+		nameSuffix += "-" + sanitizeForName(representative.PCIeRoots[0])
 	}
 
 	name := m.deviceClassName(profile, partType) + nameSuffix
@@ -253,7 +587,7 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 	}
 
 	// Sub-resources: one entry per driver with its device count, optional capacity,
-	// and per-driver CEL selectors for NUMA pinning.
+	// per-driver CEL selectors for NUMA pinning, and partition mode if applicable.
 	for driver, count := range representative.DeviceCounts {
 		sr := SubResourceConfig{
 			DeviceClass: m.rules.GetDeviceClassForDriver(driver),
@@ -262,6 +596,27 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 		if representative.DeviceCapacity != nil {
 			if cap, ok := representative.DeviceCapacity[driver]; ok {
 				sr.Capacity = cap
+			}
+		}
+
+		// Detect partition mode from representative devices' extended attributes.
+		// Drivers advertise mode via attributes like "gpu.amd.com/partitionMode".
+		for _, dev := range representative.Devices {
+			if baseDriverName(dev.DriverName) != driver {
+				continue
+			}
+			if modeAttr, mode := detectPartitionModeAttr(dev); mode != "" {
+				sr.PartitionMode = mode
+				parts := strings.SplitN(modeAttr, "/", 2)
+				if len(parts) == 2 {
+					sr.Selectors = append(sr.Selectors,
+						fmt.Sprintf(`device.attributes[%q].%s == %q`, parts[0], parts[1], mode))
+				} else {
+					// Unqualified attribute — qualify with driver name.
+					sr.Selectors = append(sr.Selectors,
+						fmt.Sprintf(`device.attributes[%q].%s == %q`, driver, modeAttr, mode))
+				}
+				break
 			}
 		}
 
@@ -297,12 +652,6 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 	// per-driver CEL selector derived from topology rules. This eliminates the
 	// requirement for all drivers to publish NUMA under a common attribute name.
 
-	// Standard alignments (request names for any remaining matchAttribute constraints)
-	requestNames := []string{"partition"}
-	for driver := range representative.DeviceCounts {
-		requestNames = append(requestNames, driver)
-	}
-
 	// Match constraint alignments from topology rules with distance-based fallback.
 	// For rules with FallbackAttribute, check if the primary constraint is satisfiable
 	// for this partition's devices. If yes, emit it (tight coupling). If not, skip it
@@ -310,8 +659,10 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 	coupling := CouplingNone
 	matchRules := m.rules.GetMatchConstraintRules()
 	for _, rule := range matchRules {
-		if _, ok := representative.DeviceCounts[rule.Driver]; !ok {
-			continue
+		if rule.Driver != "" {
+			if _, ok := representative.DeviceCounts[rule.Driver]; !ok {
+				continue
+			}
 		}
 
 		enforcement := rule.Enforcement
@@ -319,21 +670,52 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 			enforcement = EnforcementRequired
 		}
 
+		// Build request names for this constraint: only include drivers whose
+		// devices publish the attribute as a scalar value. Drivers that only
+		// publish list-type attributes (e.g., CPU's pcieRoot list) are excluded
+		// because the scheduler's matchAttribute uses scalar equality, not list
+		// membership. List-type attributes are handled by CEL includes() selectors.
+		var constraintRequests []string
+		if len(representative.Devices) > 0 {
+			driversWithScalarAttribute := make(map[string]bool)
+			for _, dev := range representative.Devices {
+				if deviceHasScalarAttribute(dev, rule.Attribute) {
+					driversWithScalarAttribute[baseDriverName(dev.DriverName)] = true
+				}
+			}
+			for driver := range representative.DeviceCounts {
+				if driversWithScalarAttribute[baseDriverName(driver)] {
+					constraintRequests = append(constraintRequests, driver)
+				}
+			}
+			if len(constraintRequests) == 0 {
+				continue
+			}
+		} else {
+			// No device data available — include all drivers
+			for driver := range representative.DeviceCounts {
+				constraintRequests = append(constraintRequests, driver)
+			}
+		}
+
 		if rule.FallbackAttribute != "" {
 			// Distance-based fallback: check if primary constraint is satisfiable
 			// for this specific partition's devices.
 			if isPartitionConstraintSatisfiable(representative.Devices, rule.Attribute, representative.DeviceCounts) {
-				// Build request list filtered to drivers that publish this attribute.
-				filteredRequests := filterRequestsByAttribute(representative.Devices, rule.Attribute, requestNames)
+				// Primary (tight) constraint works for this partition
 				config.Alignments = append(config.Alignments, AlignmentConfig{
 					Attribute:   rule.Attribute,
-					Requests:    filteredRequests,
+					Requests:    constraintRequests,
 					Enforcement: enforcement,
 				})
+				// Upgrade coupling to tight (never downgrade from tight)
 				coupling = CouplingTight
 				klog.V(2).Infof("Partition %s: primary constraint %s satisfiable (tight coupling)",
 					representative.Name, rule.Attribute)
 			} else {
+				// Primary unsatisfiable — fall back to looser alignment.
+				// Per-driver NUMA CEL selectors are already in place, so we
+				// just don't add the primary matchAttribute constraint.
 				if coupling != CouplingTight {
 					coupling = CouplingLoose
 				}
@@ -344,9 +726,137 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 			// No fallback: emit as before
 			config.Alignments = append(config.Alignments, AlignmentConfig{
 				Attribute:   rule.Attribute,
-				Requests:    requestNames,
+				Requests:    constraintRequests,
 				Enforcement: enforcement,
 			})
+		}
+	}
+
+	return config, coupling
+}
+
+// buildPartitionAggregateConfig builds a PartitionConfig without NUMA/PCIe
+// selectors for aggregate DeviceClasses. Keeps alignment constraints and
+// device counts but lets the scheduler choose placement freely.
+func (m *DeviceClassManager) buildPartitionAggregateConfig(representative PartitionDevice) (PartitionConfig, CouplingLevel) {
+	config := PartitionConfig{
+		Kind: "PartitionConfig",
+	}
+
+	for driver, count := range representative.DeviceCounts {
+		sr := SubResourceConfig{
+			DeviceClass: m.rules.GetDeviceClassForDriver(driver),
+			Count:       count,
+		}
+		if representative.DeviceCapacity != nil {
+			if cap, ok := representative.DeviceCapacity[driver]; ok {
+				sr.Capacity = cap
+			}
+		}
+		config.SubResources = append(config.SubResources, sr)
+	}
+
+	coupling := CouplingNone
+	matchRules := m.rules.GetMatchConstraintRules()
+	for _, rule := range matchRules {
+		if rule.Driver != "" {
+			if _, ok := representative.DeviceCounts[rule.Driver]; !ok {
+				continue
+			}
+		}
+
+		// For aggregate DeviceClasses, include all drivers that publish the
+		// constraint attribute in any form (scalar or list). List-type attributes
+		// work with matchAttribute constraints via intersection — e.g., a NIC VF
+		// with numaNode=[0,1,2,3] will match any device on NUMA 0, 1, 2, or 3.
+		// Try the primary attribute first; fall back if not enough drivers match.
+		constraintAttr := rule.Attribute
+		var constraintRequests []string
+		if len(representative.Devices) > 0 {
+			driversWithAttribute := make(map[string]bool)
+			for _, dev := range representative.Devices {
+				if deviceHasAttribute(dev, constraintAttr) {
+					driversWithAttribute[baseDriverName(dev.DriverName)] = true
+				}
+			}
+			for driver := range representative.DeviceCounts {
+				if driversWithAttribute[baseDriverName(driver)] {
+					constraintRequests = append(constraintRequests, driver)
+				}
+			}
+			// Fall back to the fallback attribute if primary doesn't cover enough drivers
+			if len(constraintRequests) < 2 && rule.FallbackAttribute != "" {
+				constraintAttr = rule.FallbackAttribute
+				driversWithAttribute = make(map[string]bool)
+				for _, dev := range representative.Devices {
+					if deviceHasAttribute(dev, constraintAttr) {
+						driversWithAttribute[baseDriverName(dev.DriverName)] = true
+					}
+				}
+				constraintRequests = nil
+				for driver := range representative.DeviceCounts {
+					if driversWithAttribute[baseDriverName(driver)] {
+						constraintRequests = append(constraintRequests, driver)
+					}
+				}
+			}
+			if len(constraintRequests) == 0 {
+				continue
+			}
+		}
+
+		if len(constraintRequests) < 2 {
+			continue
+		}
+
+		enforcement := rule.Enforcement
+		if enforcement == "" {
+			enforcement = EnforcementRequired
+		}
+
+		config.Alignments = append(config.Alignments, AlignmentConfig{
+			Attribute:   constraintAttr,
+			Requests:    constraintRequests,
+			Enforcement: enforcement,
+		})
+		coupling = CouplingTight
+
+		// If the primary constraint didn't cover all drivers and a fallback
+		// attribute exists, add a second alignment on the fallback attribute
+		// covering all drivers. This ensures devices like memory (which lack
+		// pcieRoot but have numaNode) are co-located with the rest.
+		if rule.FallbackAttribute != "" && constraintAttr != rule.FallbackAttribute {
+			coveredDrivers := make(map[string]bool)
+			for _, r := range constraintRequests {
+				coveredDrivers[r] = true
+			}
+			uncoveredCount := 0
+			for driver := range representative.DeviceCounts {
+				if !coveredDrivers[driver] {
+					uncoveredCount++
+				}
+			}
+			if uncoveredCount > 0 {
+				fallbackDrivers := make(map[string]bool)
+				for _, dev := range representative.Devices {
+					if deviceHasAttribute(dev, rule.FallbackAttribute) {
+						fallbackDrivers[baseDriverName(dev.DriverName)] = true
+					}
+				}
+				var fallbackRequests []string
+				for driver := range representative.DeviceCounts {
+					if fallbackDrivers[baseDriverName(driver)] {
+						fallbackRequests = append(fallbackRequests, driver)
+					}
+				}
+				if len(fallbackRequests) > len(constraintRequests) {
+					config.Alignments = append(config.Alignments, AlignmentConfig{
+						Attribute:   rule.FallbackAttribute,
+						Requests:    fallbackRequests,
+						Enforcement: enforcement,
+					})
+				}
+			}
 		}
 	}
 
@@ -413,46 +923,32 @@ func numaKeySuffix(numaNodes []int64) string {
 	return s
 }
 
-// filterRequestsByAttribute returns the subset of request names whose drivers
-// actually publish the given attribute. This prevents including non-PCI drivers
-// (CPU, memory) in pcieRoot constraints.
-func filterRequestsByAttribute(devices []TopologyDevice, attribute string, allRequests []string) []string {
-	driversWithAttr := make(map[string]bool)
-	for _, dev := range devices {
-		if deviceAttributeValueString(dev, attribute) != "" {
-			driversWithAttr[baseDriverName(dev.DriverName)] = true
-		}
-	}
-	var filtered []string
-	for _, req := range allRequests {
-		if req == "partition" || driversWithAttr[baseDriverName(req)] {
-			filtered = append(filtered, req)
-		}
-	}
-	return filtered
-}
-
 // isPartitionConstraintSatisfiable checks whether a partition's devices can
 // satisfy a matchAttribute constraint. It groups the partition's devices by
 // the attribute value and checks if any group meets all driver count requirements.
 // This is a local check on the partition's Devices slice, not a cluster-wide check.
 func isPartitionConstraintSatisfiable(devices []TopologyDevice, attribute string, driverCounts map[string]int) bool {
 	groups := make(map[string]map[string]int) // attrValue → baseDriverName → count
+
+	// Track which drivers actually publish this attribute
 	driversWithAttribute := make(map[string]bool)
 
 	for _, dev := range devices {
-		val := deviceAttributeValueString(dev, attribute)
-		if val == "" {
-			continue
+		vals := deviceAttributeValues(dev, attribute)
+		if len(vals) == 0 {
+			continue // Device doesn't publish this attribute
 		}
 		driver := baseDriverName(dev.DriverName)
 		driversWithAttribute[driver] = true
-		if groups[val] == nil {
-			groups[val] = make(map[string]int)
+		for _, val := range vals {
+			if groups[val] == nil {
+				groups[val] = make(map[string]int)
+			}
+			groups[val][driver]++
 		}
-		groups[val][driver]++
 	}
 
+	// Need at least 2 drivers with the attribute for a meaningful constraint
 	if len(driversWithAttribute) < 2 {
 		return false
 	}
@@ -461,6 +957,8 @@ func isPartitionConstraintSatisfiable(devices []TopologyDevice, attribute string
 		satisfied := true
 		for driver, needed := range driverCounts {
 			base := baseDriverName(driver)
+			// Only check drivers that actually publish this attribute.
+			// CPU/memory don't publish pcieRoot — skip them.
 			if !driversWithAttribute[base] {
 				continue
 			}
@@ -474,6 +972,363 @@ func isPartitionConstraintSatisfiable(devices []TopologyDevice, attribute string
 		}
 	}
 	return false
+}
+
+// SyncGroupingDeviceClasses creates or updates DeviceClass objects for each
+// satisfiable grouping instance discovered across all nodes.
+func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, results []GroupingResult) error {
+	type groupingEntry struct {
+		representative GroupingInstance
+		config         PartitionConfig
+		count          int
+	}
+
+	seen := make(map[string]*groupingEntry)
+	for _, result := range results {
+		for _, inst := range result.Instances {
+			config := m.buildGroupingConfig(inst)
+
+			nk := numaKey(inst.NUMANodes)
+			pk := strings.Join(inst.PCIeRoots, "-")
+			key := truncateLabel(inst.GroupingName) + "-" + sanitizeForName(inst.Alignment)
+			if pk != "" {
+				key += "-" + sanitizeForName(pk)
+			} else if nk != "" {
+				key += "-numa" + nk
+			}
+
+			if entry, ok := seen[key]; ok {
+				entry.count++
+			} else {
+				seen[key] = &groupingEntry{
+					representative: inst,
+					config:         config,
+					count:          1,
+				}
+			}
+		}
+	}
+
+	// Emit per-instance DeviceClasses with rail index in name
+	for key, entry := range seen {
+		dc := m.buildGroupingDeviceClass(key, entry.representative, entry.config, entry.count)
+		dc.Name = fmt.Sprintf("%s-rail%d", sanitizeForName(entry.representative.GroupingName), entry.representative.RailIndex)
+		if err := m.publishDeviceClass(ctx, dc); err != nil {
+			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
+		}
+	}
+
+	// Emit aggregate DeviceClasses (one per grouping name, no NUMA selector).
+	// Lets users request "any gpu-nic-pair" without specifying a NUMA node;
+	// the scheduler finds a satisfiable placement automatically.
+	aggregates := make(map[string]*groupingEntry)
+	for _, entry := range seen {
+		name := entry.representative.GroupingName
+		if _, ok := aggregates[name]; !ok {
+			aggConfig := m.buildGroupingAggregateConfig(entry.representative)
+			aggregates[name] = &groupingEntry{
+				representative: entry.representative,
+				config:         aggConfig,
+				count:          entry.count,
+			}
+		} else {
+			aggregates[name].count += entry.count
+		}
+	}
+	for _, entry := range aggregates {
+		aggKey := truncateLabel(entry.representative.GroupingName) + "-" + sanitizeForName(entry.representative.Alignment)
+		dc := m.buildGroupingDeviceClass(aggKey, entry.representative, entry.config, entry.count)
+		dc.Name = sanitizeForName(entry.representative.GroupingName)
+		delete(dc.Labels, CoordinatorDriverName+"/numa")
+		if err := m.publishDeviceClass(ctx, dc); err != nil {
+			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
+		}
+	}
+
+	activeNames := make(map[string]bool, len(seen)+len(aggregates))
+	for _, entry := range seen {
+		name := fmt.Sprintf("%s-rail%d", sanitizeForName(entry.representative.GroupingName), entry.representative.RailIndex)
+		activeNames[name] = true
+	}
+	for _, entry := range aggregates {
+		name := sanitizeForName(entry.representative.GroupingName)
+		activeNames[name] = true
+	}
+	if err := m.cleanupStaleGroupingDeviceClasses(ctx, activeNames); err != nil {
+		klog.Errorf("Failed to cleanup stale grouping DeviceClasses: %v", err)
+	}
+
+	klog.Infof("Synced %d grouping DeviceClasses", len(seen))
+	return nil
+}
+
+// buildGroupingConfig builds the opaque PartitionConfig from a grouping instance.
+func (m *DeviceClassManager) buildGroupingConfig(inst GroupingInstance) PartitionConfig {
+	return m.buildGroupingConfigInternal(inst, true)
+}
+
+// buildGroupingAggregateConfig builds a PartitionConfig without NUMA selectors,
+// so the scheduler can place on any NUMA node with available devices.
+func (m *DeviceClassManager) buildGroupingAggregateConfig(inst GroupingInstance) PartitionConfig {
+	return m.buildGroupingConfigInternal(inst, false)
+}
+
+func (m *DeviceClassManager) buildGroupingConfigInternal(inst GroupingInstance, includeNUMA bool) PartitionConfig {
+	config := PartitionConfig{
+		Kind: "PartitionConfig",
+	}
+
+	for driverClass, count := range inst.DeviceCounts {
+		sr := SubResourceConfig{
+			DeviceClass: driverClass,
+			Count:       count,
+		}
+
+		if cap, ok := inst.DeviceCapacity[driverClass]; ok {
+			sr.Capacity = cap
+		}
+
+		if includeNUMA && len(inst.NUMANodes) > 0 {
+			driver := m.driverForClass(driverClass)
+			if attr, ok := m.rules.GetNUMAAttributeForDriver(driver); ok {
+				if !strings.Contains(attr, "/") {
+					attr = driver + "/" + attr
+				}
+				cel := BuildNUMACELSelector(attr, inst.NUMANodes)
+				if cel != "" {
+					sr.Selectors = append(sr.Selectors, cel)
+				}
+			} else {
+				cel := BuildNUMACELSelector(AttrNUMANode, inst.NUMANodes)
+				if cel != "" {
+					sr.Selectors = append(sr.Selectors, cel)
+				}
+			}
+		}
+
+		config.SubResources = append(config.SubResources, sr)
+	}
+
+	matchRules := m.rules.GetMatchConstraintRules()
+	for _, rule := range matchRules {
+		if rule.Driver != "" {
+			if _, ok := inst.DeviceCounts[m.rules.GetDeviceClassForDriver(rule.Driver)]; !ok {
+				continue
+			}
+		}
+
+		var constraintRequests []string
+		if len(inst.Devices) > 0 {
+			driversWithAttribute := make(map[string]bool)
+			for _, dev := range inst.Devices {
+				val := deviceAttributeValueString(dev, rule.Attribute)
+				if val != "" {
+					driversWithAttribute[baseDriverName(dev.DriverName)] = true
+				}
+			}
+			for driver := range inst.DeviceCounts {
+				rawDriver := m.driverForClass(driver)
+				if driversWithAttribute[baseDriverName(rawDriver)] {
+					constraintRequests = append(constraintRequests, driver)
+				}
+			}
+		}
+
+		if len(constraintRequests) < 2 {
+			continue
+		}
+
+		enforcement := rule.Enforcement
+		if enforcement == "" {
+			enforcement = EnforcementRequired
+		}
+
+		config.Alignments = append(config.Alignments, AlignmentConfig{
+			Attribute:   rule.Attribute,
+			Requests:    constraintRequests,
+			Enforcement: enforcement,
+		})
+	}
+
+	return config
+}
+
+// buildGroupingDeviceClass constructs a DeviceClass for a grouping instance.
+func (m *DeviceClassManager) buildGroupingDeviceClass(
+	key string,
+	representative GroupingInstance,
+	config PartitionConfig,
+	count int,
+) *resourcev1.DeviceClass {
+	name := sanitizeDNSLabel(key)
+
+	celExpr := fmt.Sprintf(
+		`device.driver == %q && device.attributes[%q].grouping == %q`,
+		m.driverName, m.driverName, representative.GroupingName,
+	)
+
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		klog.Errorf("Failed to marshal grouping config: %v", err)
+		configJSON = []byte("{}")
+	}
+
+	labels := map[string]string{
+		CoordinatorDriverName + "/managed":   "true",
+		CoordinatorDriverName + "/grouping":  truncateLabel(representative.GroupingName),
+		CoordinatorDriverName + "/alignment": representative.Alignment,
+		CoordinatorDriverName + "/railIndex": fmt.Sprintf("%d", representative.RailIndex),
+	}
+	if len(representative.NUMANodes) > 0 {
+		labels[CoordinatorDriverName+"/numa"] = numaKey(representative.NUMANodes)
+	}
+	if count > 1 {
+		labels[CoordinatorDriverName+"/count"] = fmt.Sprintf("%d", count)
+	}
+
+	return &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: labels,
+		},
+		Spec: resourcev1.DeviceClassSpec{
+			Selectors: []resourcev1.DeviceSelector{
+				{
+					CEL: &resourcev1.CELDeviceSelector{
+						Expression: celExpr,
+					},
+				},
+			},
+			Config: []resourcev1.DeviceClassConfiguration{
+				{
+					DeviceConfiguration: resourcev1.DeviceConfiguration{
+						Opaque: &resourcev1.OpaqueDeviceConfiguration{
+							Driver:     m.driverName,
+							Parameters: runtime.RawExtension{Raw: configJSON},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// cleanupStaleGroupingDeviceClasses removes grouping DeviceClasses that no longer match.
+func (m *DeviceClassManager) cleanupStaleGroupingDeviceClasses(ctx context.Context, active map[string]bool) error {
+	labelSelector := fmt.Sprintf("%s/managed=true,%s/grouping", CoordinatorDriverName, CoordinatorDriverName)
+	classes, err := m.client.ResourceV1().DeviceClasses().List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list grouping DeviceClasses: %w", err)
+	}
+
+	for _, dc := range classes.Items {
+		if _, exists := active[dc.Name]; !exists {
+			if err := m.client.ResourceV1().DeviceClasses().Delete(ctx, dc.Name, metav1.DeleteOptions{}); err != nil {
+				if !errors.IsNotFound(err) {
+					klog.Errorf("Failed to delete stale grouping DeviceClass %s: %v", dc.Name, err)
+				}
+			} else {
+				klog.Infof("Deleted stale grouping DeviceClass %s", dc.Name)
+			}
+		}
+	}
+	return nil
+}
+
+// driverForClass returns the raw driver name for a DeviceClass name.
+// If a topology rule overrides the class name, this reverse-maps it.
+func (m *DeviceClassManager) driverForClass(className string) string {
+	for _, rule := range m.rules.GetRules() {
+		if rule.DeviceClass == className {
+			return rule.Driver
+		}
+	}
+	return className
+}
+
+// sanitizeDNSLabel converts a string to a valid DNS label (max 63 chars).
+func sanitizeDNSLabel(s string) string {
+	sanitized := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return '-'
+	}, s)
+
+	for strings.Contains(sanitized, "--") {
+		sanitized = strings.ReplaceAll(sanitized, "--", "-")
+	}
+	sanitized = strings.Trim(sanitized, "-")
+
+	if sanitized == "" {
+		sanitized = "default"
+	}
+
+	if len(sanitized) > 63 {
+		h := sha256.Sum256([]byte(sanitized))
+		hash := hex.EncodeToString(h[:4])
+		sanitized = sanitized[:54] + "-" + hash
+	}
+
+	return sanitized
+}
+
+type frac struct{ n, d int }
+
+var fractionNames = map[frac]string{
+	{1, 16}: "sixteenth",
+	{1, 12}: "twelfth",
+	{1, 8}:  "eighth",
+	{1, 6}:  "sixth",
+	{1, 4}:  "quarter",
+	{1, 3}:  "third",
+	{1, 2}:  "half",
+	{1, 1}:  "full",
+}
+
+// fractionToTierName maps a reduced fraction (numerator/denominator) to a
+// human-readable tier name. Returns "" for fractions without a well-known name.
+func fractionToTierName(numerator, denominator int) string {
+	if denominator == 0 || numerator == 0 {
+		return ""
+	}
+	g := gcd(numerator, denominator)
+	return fractionNames[frac{numerator / g, denominator / g}]
+}
+
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+// partitionModeAttributeSuffixes lists attribute name suffixes that indicate
+// a device's partition mode (e.g., "partitionMode", "computePartition").
+var partitionModeAttributeSuffixes = []string{
+	"partitionMode",
+	"computePartition",
+	"mode",
+}
+
+// detectPartitionModeAttr returns the attribute name and mode value from a
+// device's extended attributes. Returns ("", "") if no partition mode found.
+func detectPartitionModeAttr(dev TopologyDevice) (attrName string, mode string) {
+	for name, val := range dev.ExtendedAttributes {
+		for _, suffix := range partitionModeAttributeSuffixes {
+			if strings.HasSuffix(name, "/"+suffix) || name == suffix {
+				if val.StringValue != nil {
+					return name, *val.StringValue
+				}
+			}
+		}
+	}
+	return "", ""
 }
 
 // publishDeviceClass creates or updates a DeviceClass.

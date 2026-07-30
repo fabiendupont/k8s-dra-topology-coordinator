@@ -52,9 +52,11 @@ type TopologyDevice struct {
 	PoolName string
 
 	// Standard topology attributes
-	NUMANode *int64
-	PCIeRoot *string
-	Socket   *int64
+	NUMANode  *int64
+	NUMANodes []int64
+	PCIeRoot  *string
+	PCIeRoots []string
+	Socket    *int64
 
 	// Extended attributes from topology rules (attribute qualified name -> value).
 	ExtendedAttributes map[string]DeviceAttributeValue
@@ -419,25 +421,71 @@ func (m *TopologyModel) isConstraintSatisfiableOnNode(nt *NodeTopology, attribut
 // deviceAttributeValueString returns the string representation of the device's
 // value for the given attribute, checking standard attributes and extended attributes.
 func deviceAttributeValueString(dev TopologyDevice, attribute string) string {
+	vals := deviceAttributeValues(dev, attribute)
+	if len(vals) > 0 {
+		return vals[0]
+	}
+	return ""
+}
+
+func deviceAttributeValues(dev TopologyDevice, attribute string) []string {
 	switch attribute {
 	case AttrNUMANode:
+		if len(dev.NUMANodes) > 0 {
+			vals := make([]string, len(dev.NUMANodes))
+			for i, n := range dev.NUMANodes {
+				vals[i] = fmt.Sprintf("%d", n)
+			}
+			return vals
+		}
 		if dev.NUMANode != nil {
-			return fmt.Sprintf("%d", *dev.NUMANode)
+			return []string{fmt.Sprintf("%d", *dev.NUMANode)}
 		}
 	case AttrPCIeRoot:
+		if len(dev.PCIeRoots) > 0 {
+			return dev.PCIeRoots
+		}
 		if dev.PCIeRoot != nil {
-			return *dev.PCIeRoot
+			return []string{*dev.PCIeRoot}
 		}
 	case AttrSocket:
 		if dev.Socket != nil {
-			return fmt.Sprintf("%d", *dev.Socket)
+			return []string{fmt.Sprintf("%d", *dev.Socket)}
 		}
 	default:
 		if v, ok := dev.ExtendedAttributes[attribute]; ok {
-			return v.String()
+			return []string{v.String()}
 		}
 	}
-	return ""
+	return nil
+}
+
+func deviceHasAttribute(dev TopologyDevice, attribute string) bool {
+	switch attribute {
+	case AttrNUMANode:
+		return dev.NUMANode != nil || len(dev.NUMANodes) > 0
+	case AttrPCIeRoot:
+		return dev.PCIeRoot != nil || len(dev.PCIeRoots) > 0
+	case AttrSocket:
+		return dev.Socket != nil
+	default:
+		_, ok := dev.ExtendedAttributes[attribute]
+		return ok
+	}
+}
+
+func deviceHasScalarAttribute(dev TopologyDevice, attribute string) bool {
+	switch attribute {
+	case AttrNUMANode:
+		return dev.NUMANode != nil
+	case AttrPCIeRoot:
+		return dev.PCIeRoot != nil
+	case AttrSocket:
+		return dev.Socket != nil
+	default:
+		_, ok := dev.ExtendedAttributes[attribute]
+		return ok
+	}
 }
 
 // extractTopologyDevice extracts topology attributes from a device's attributes.

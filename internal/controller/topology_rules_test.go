@@ -230,8 +230,10 @@ func TestTopologyRuleStore_GetMatchConstraintRules(t *testing.T) {
 	require.NoError(t, err)
 
 	match := store.GetMatchConstraintRules()
-	assert.Len(t, match, 1)
+	assert.Len(t, match, 2)
 	assert.Equal(t, "gpu.nvidia.com/nvlinkDomain", match[0].Attribute)
+	assert.Equal(t, AttrPCIeRoot, match[1].Attribute, "builtin pcieRoot default should be appended")
+	assert.Equal(t, AttrNUMANode, match[1].FallbackAttribute)
 }
 
 func TestTopologyRuleStore_NilConfigMap(t *testing.T) {

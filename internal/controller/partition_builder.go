@@ -3,7 +3,6 @@ package controller
 import (
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -14,10 +13,9 @@ import (
 type PartitionType string
 
 const (
-	PartitionEighth  PartitionType = "eighth"
-	PartitionQuarter PartitionType = "quarter"
-	PartitionHalf    PartitionType = "half"
-	PartitionFull    PartitionType = "full"
+	PartitionPCIeRoot PartitionType = "pcieroot"
+	PartitionNUMA     PartitionType = "numa"
+	PartitionFull     PartitionType = "full"
 )
 
 // PartitionDevice represents a computed partition that the coordinator will publish
@@ -92,6 +90,82 @@ func (b *PartitionBuilder) BuildPartitions() []PartitionResult {
 	return results
 }
 
+// DetectPCIeRootPairings auto-discovers device pairings by finding PCIe roots
+// that host devices from 2+ different drivers. Each unique driver combination
+// produces a DeviceGrouping with pcieRoot alignment and numaNode fallback.
+// Capacity-only drivers (CPU, memory) are excluded.
+func (b *PartitionBuilder) DetectPCIeRootPairings() []DeviceGrouping {
+	nodes := b.model.GetNodeTopologies()
+
+	type driverPair struct{ a, b string }
+	seen := make(map[driverPair]bool)
+	var groupings []DeviceGrouping
+
+	for _, nodeTopo := range nodes {
+		allDevices := nodeTopo.AllDevices()
+
+		byPCIeRoot := groupDevicesByAttribute(allDevices, func(d TopologyDevice) string {
+			if d.PCIeRoot != nil {
+				return *d.PCIeRoot
+			}
+			return ""
+		})
+
+		for rootKey, devices := range byPCIeRoot {
+			if rootKey == "" {
+				continue
+			}
+
+			// Collect unique PCI drivers on this root (exclude capacity-only)
+			pciDrivers := make(map[string]int)
+			for _, d := range devices {
+				driver := baseDriverName(d.DriverName)
+				if len(d.Capacity) > 0 && d.PCIeRoot == nil {
+					continue
+				}
+				pciDrivers[driver]++
+			}
+
+			if len(pciDrivers) < 2 {
+				continue
+			}
+
+			// Create pairings for each unique driver combination
+			drivers := make([]string, 0, len(pciDrivers))
+			for d := range pciDrivers {
+				drivers = append(drivers, d)
+			}
+			sort.Strings(drivers)
+
+			for i := 0; i < len(drivers); i++ {
+				for j := i + 1; j < len(drivers); j++ {
+					pair := driverPair{drivers[i], drivers[j]}
+					if seen[pair] {
+						continue
+					}
+					seen[pair] = true
+
+					classA := b.rules.GetDeviceClassForDriver(drivers[i])
+					classB := b.rules.GetDeviceClassForDriver(drivers[j])
+					name := sanitizeDNSLabel(
+						sanitizeForName(classA) + "-" + sanitizeForName(classB) + "-pair")
+					groupings = append(groupings, DeviceGrouping{
+						Name:      name,
+						Alignment: "pcieRoot",
+						Fallback:  "numaNode",
+						Devices: []GroupingDevice{
+							{Class: b.rules.GetDeviceClassForDriver(drivers[i]), Count: 1},
+							{Class: b.rules.GetDeviceClassForDriver(drivers[j]), Count: 1},
+						},
+					})
+				}
+			}
+		}
+	}
+
+	return groupings
+}
+
 // buildNodePartitions computes partitions for a single node.
 func (b *PartitionBuilder) buildNodePartitions(
 	nodeName string,
@@ -125,18 +199,18 @@ func (b *PartitionBuilder) buildNodePartitions(
 		driverDeviceCounts[baseDriverName(g.DriverName)] += g.MaxEffective
 	}
 
-	// Group devices by NUMA node
-	byNUMA := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
-		if d.NUMANode != nil {
-			return fmt.Sprintf("%d", *d.NUMANode)
+	// Group devices by PCIe root for the finest-grained partitioning
+	byPCIeRoot := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
+		if d.PCIeRoot != nil {
+			return *d.PCIeRoot
 		}
 		return ""
 	})
 
-	// Group devices by socket
-	bySocket := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
-		if d.Socket != nil {
-			return fmt.Sprintf("%d", *d.Socket)
+	// Group devices by NUMA node
+	byNUMA := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
+		if d.NUMANode != nil {
+			return fmt.Sprintf("%d", *d.NUMANode)
 		}
 		return ""
 	})
@@ -149,51 +223,18 @@ func (b *PartitionBuilder) buildNodePartitions(
 		}
 	}
 
-	// Build partitions by successive bisection.
-	// Walk socket → NUMA → PCIe root; assign half/quarter/eighth
-	// to boundaries that actually split. Skip boundaries that don't.
 	profile := b.inferProfile(driverDeviceCounts)
 	result.Profile = profile
 
-	tiers := []PartitionType{PartitionHalf, PartitionQuarter, PartitionEighth}
-	tierIdx := 0
-	prevCount := 1
+	// Build pcieRoot partitions: one per PCIe root with proportional CPU/memory
+	pciePartitions := b.buildPCIeRootPartitions(nodeName, profile, byNUMA, byPCIeRoot, effectiveDevices)
+	result.Partitions = append(result.Partitions, pciePartitions...)
 
-	socketCount := countNonEmptyGroups(bySocket)
-	numaCount := countNonEmptyGroups(byNUMA)
+	// Build NUMA partitions: one per NUMA node with all devices on that NUMA
+	numaPartitions := b.buildPartitionsFromGroups(nodeName, profile, PartitionNUMA, byNUMA, groupingRules)
+	result.Partitions = append(result.Partitions, numaPartitions...)
 
-	socketTier := PartitionType("")
-	numaTier := PartitionType("")
-	pcieTier := PartitionType("")
-
-	if socketCount > prevCount && tierIdx < len(tiers) {
-		socketTier = tiers[tierIdx]
-		prevCount = socketCount
-		tierIdx++
-	}
-	if numaCount > prevCount && tierIdx < len(tiers) {
-		numaTier = tiers[tierIdx]
-		tierIdx++
-	}
-	if tierIdx < len(tiers) {
-		pcieTier = tiers[tierIdx]
-	}
-
-	if pcieTier != "" {
-		p := b.buildProportionalPartitions(nodeName, profile, pcieTier, byNUMA, effectiveDevices)
-		result.Partitions = append(result.Partitions, p...)
-	}
-
-	if numaTier != "" {
-		p := b.buildPartitionsFromGroups(nodeName, profile, numaTier, byNUMA, groupingRules)
-		result.Partitions = append(result.Partitions, p...)
-	}
-
-	if socketTier != "" {
-		p := b.buildPartitionsFromGroups(nodeName, profile, socketTier, bySocket, groupingRules)
-		result.Partitions = append(result.Partitions, p...)
-	}
-
+	// Build full partition: all devices on the node
 	full := b.buildFullPartition(nodeName, profile, effectiveDevices, groupingRules)
 	if full != nil {
 		result.Partitions = append(result.Partitions, *full)
@@ -203,10 +244,10 @@ func (b *PartitionBuilder) buildNodePartitions(
 	for _, p := range result.Partitions {
 		tierCounts[p.Type]++
 	}
-	klog.Infof("Node %s (profile=%s): computed %d partitions (%d eighth, %d quarter, %d half, %d full)",
+	klog.Infof("Node %s (profile=%s): computed %d partitions (%d pcieRoot, %d numa, %d full)",
 		nodeName, profile, len(result.Partitions),
-		tierCounts[PartitionEighth], tierCounts[PartitionQuarter],
-		tierCounts[PartitionHalf], tierCounts[PartitionFull])
+		tierCounts[PartitionPCIeRoot], tierCounts[PartitionNUMA],
+		tierCounts[PartitionFull])
 
 	return result
 }
@@ -264,33 +305,38 @@ func (b *PartitionBuilder) buildPartitionsFromGroups(
 			fmt.Sprintf("%s-%s-%d", nodeName, partType, i),
 			nodeName, profile, partType, devices,
 		)
+
+		// Enrich with capacity from shared devices (CPU, memory). For NUMA
+		// partitions the full capacity of each device applies (no division,
+		// unlike pcieRoot which splits across roots).
+		for _, d := range devices {
+			driver := baseDriverName(d.DriverName)
+			if len(d.Capacity) > 0 {
+				if p.DeviceCapacity == nil {
+					p.DeviceCapacity = make(map[string]map[string]string)
+				}
+				if _, has := p.DeviceCapacity[driver]; !has {
+					p.DeviceCapacity[driver] = d.Capacity
+				}
+			}
+		}
+
 		partitions = append(partitions, p)
 	}
 
 	return partitions
 }
 
-// buildProportionalPartitions subdivides each NUMA node into equal partitions.
-// It counts PCIe root groups per NUMA to determine the subdivision factor,
-// then divides all device types proportionally. Shared devices (count=1 per NUMA)
-// get capacity divided via DRAConsumableCapacity.
-func (b *PartitionBuilder) buildProportionalPartitions(
+// buildPCIeRootPartitions creates one partition per PCIe root complex.
+// Each partition contains all devices on that PCIe root, plus a proportional
+// share of the parent NUMA node's CPU and memory (equal split by default).
+func (b *PartitionBuilder) buildPCIeRootPartitions(
 	nodeName, profile string,
-	partType PartitionType,
 	byNUMA map[string][]TopologyDevice,
+	byPCIeRoot map[string][]TopologyDevice,
 	allDevices []TopologyDevice,
 ) []PartitionDevice {
-	// Count PCIe root groups per NUMA node to determine subdivision factor
-	numaSubdivisions := make(map[string]int) // NUMA key → number of PCIe roots
-	for _, d := range allDevices {
-		if d.NUMANode == nil || d.PCIeRoot == nil {
-			continue
-		}
-		numaKey := fmt.Sprintf("%d", *d.NUMANode)
-		numaSubdivisions[numaKey]++
-	}
-
-	// Deduplicate: count unique PCIe roots per NUMA
+	// Count unique PCIe roots per NUMA node for CPU/memory division
 	numaPCIeRoots := make(map[string]map[string]bool)
 	for _, d := range allDevices {
 		if d.NUMANode == nil || d.PCIeRoot == nil {
@@ -303,97 +349,60 @@ func (b *PartitionBuilder) buildProportionalPartitions(
 		numaPCIeRoots[numaKey][*d.PCIeRoot] = true
 	}
 
-	// For each NUMA node, compute how many quarter partitions to create
-	var partitions []PartitionDevice
-	partIdx := 0
-
-	numaKeys := make([]string, 0, len(byNUMA))
-	for k := range byNUMA {
+	// Sort PCIe root keys for deterministic output
+	pcieKeys := make([]string, 0, len(byPCIeRoot))
+	for k := range byPCIeRoot {
 		if k != "" {
-			numaKeys = append(numaKeys, k)
+			pcieKeys = append(pcieKeys, k)
 		}
 	}
-	sort.Strings(numaKeys)
+	sort.Strings(pcieKeys)
 
-	for _, numaKey := range numaKeys {
-		devices := byNUMA[numaKey]
-		numPCIeRoots := len(numaPCIeRoots[numaKey])
-		if numPCIeRoots <= 1 {
-			continue // no subdivision possible
-		}
+	var partitions []PartitionDevice
+	for idx, pcieKey := range pcieKeys {
+		devices := byPCIeRoot[pcieKey]
+		p := buildPartitionFromDevices(
+			fmt.Sprintf("%s-pcieRoot-%d", nodeName, idx),
+			nodeName, profile, PartitionPCIeRoot, devices,
+		)
 
-		// Count devices per driver on this NUMA node
-		driverCounts := make(map[string]int)
+		// Add proportional CPU/memory from the parent NUMA node.
+		// Find which NUMA this PCIe root belongs to and how many roots share it.
+		var parentNUMA string
 		for _, d := range devices {
-			baseName := baseDriverName(d.DriverName)
-			driverCounts[baseName]++
-		}
-
-		// Determine subdivision factor: use the number of unique PCIe roots
-		// but only consider drivers with multiple devices (>1).
-		// Drivers with 1 device per NUMA (e.g., CPU, memory) are shared
-		// via DRAConsumableCapacity and don't limit subdivision.
-		subdivisions := numPCIeRoots
-		for driver, count := range driverCounts {
-			if count > 1 && count < subdivisions {
-				klog.V(4).Infof("NUMA %s: reducing subdivisions from %d to %d (limited by %s with %d devices)",
-					numaKey, subdivisions, count, driver, count)
-				subdivisions = count
+			if d.NUMANode != nil {
+				parentNUMA = fmt.Sprintf("%d", *d.NUMANode)
+				break
 			}
 		}
-
-		if subdivisions <= 1 {
-			continue
-		}
-
-		// Parse NUMA node ID for topology-aware CEL selectors
-		numaVal, _ := strconv.ParseInt(numaKey, 10, 64)
-
-		// Create subdivided partitions
-		for i := 0; i < subdivisions; i++ {
-			p := PartitionDevice{
-				Name:               fmt.Sprintf("%s-%s-%d", nodeName, partType, partIdx),
-				NodeName:           nodeName,
-				Type:               partType,
-				Profile:            profile,
-				NUMANodes:          []int64{numaVal},
-				DeviceCounts:       make(map[string]int),
-				Devices:            nil, // representative only
-				ExtendedAttributes: make(map[string]DeviceAttributeValue),
-			}
-
-			p.DeviceCapacity = make(map[string]map[string]string)
-			for driver, count := range driverCounts {
-				divided := count / subdivisions
-				if divided == 0 {
-					divided = 1 // shared devices get count=1 per partition
-					// For shared devices, compute capacity per partition
-					// by dividing total capacity by number of subdivisions
-					for _, d := range devices {
-						if baseDriverName(d.DriverName) == driver && len(d.Capacity) > 0 {
-							capPerPartition := make(map[string]string)
-							for capName, capVal := range d.Capacity {
-								divided := divideQuantity(capVal, subdivisions)
-								if divided != "" {
-									capPerPartition[capName] = divided
-								}
+		if parentNUMA != "" {
+			numRoots := len(numaPCIeRoots[parentNUMA])
+			if numRoots > 0 {
+				numaDevices := byNUMA[parentNUMA]
+				for _, d := range numaDevices {
+					driver := baseDriverName(d.DriverName)
+					if len(d.Capacity) > 0 && p.DeviceCounts[driver] == 0 {
+						if p.DeviceCapacity == nil {
+							p.DeviceCapacity = make(map[string]map[string]string)
+						}
+						capPerPartition := make(map[string]string)
+						for capName, capVal := range d.Capacity {
+							dv := divideQuantity(capVal, numRoots)
+							if dv != "" {
+								capPerPartition[capName] = dv
 							}
-							if len(capPerPartition) > 0 {
-								p.DeviceCapacity[driver] = capPerPartition
-							}
-							break // use first device's capacity as representative
+						}
+						if len(capPerPartition) > 0 {
+							p.DeviceCapacity[driver] = capPerPartition
+							p.DeviceCounts[driver] = 1
+							p.Devices = append(p.Devices, d)
 						}
 					}
 				}
-				p.DeviceCounts[driver] = divided
 			}
-
-			// Use a subset of devices as representative
-			p.Devices = devices // all same-NUMA devices for attribute lookup
-
-			partitions = append(partitions, p)
-			partIdx++
 		}
+
+		partitions = append(partitions, p)
 	}
 
 	return partitions
@@ -435,10 +444,10 @@ func buildPartitionFromDevices(
 	pcieSet := make(map[string]bool)
 	socketSet := make(map[int64]bool)
 
-	for _, d := range devices {
-		baseName := baseDriverName(d.DriverName)
-		p.DeviceCounts[baseName]++
+	// Use effective counting to handle overlapping partitionable devices.
+	p.DeviceCounts = EffectiveDeviceCount(devices)
 
+	for _, d := range devices {
 		if d.NUMANode != nil {
 			numaSet[*d.NUMANode] = true
 		}
@@ -475,12 +484,14 @@ func buildPartitionFromDevices(
 	return p
 }
 
-// inferProfile attempts to identify the hardware profile from device counts and driver names.
+// inferProfile identifies the hardware profile from driver names only.
+// Device counts are excluded to keep the profile (and DeviceClass names)
+// stable across transient device count changes from driver restarts or
+// allocation events.
 func (b *PartitionBuilder) inferProfile(driverDeviceCounts map[string]int) string {
-	// Build a simple profile string from driver names and counts
 	var parts []string
-	for driver, count := range driverDeviceCounts {
-		parts = append(parts, fmt.Sprintf("%s-%d", driver, count))
+	for driver := range driverDeviceCounts {
+		parts = append(parts, driver)
 	}
 	sort.Strings(parts)
 	if len(parts) == 0 {
@@ -561,16 +572,6 @@ func baseDriverName(driverName string) string {
 		return driverName[:idx]
 	}
 	return driverName
-}
-
-func countNonEmptyGroups(groups map[string][]TopologyDevice) int {
-	count := 0
-	for key := range groups {
-		if key != "" {
-			count++
-		}
-	}
-	return count
 }
 
 // divideQuantity divides a Kubernetes quantity string by a divisor.

@@ -40,6 +40,7 @@ const (
 var (
 	kubecfg                 string
 	driverName              string
+	partitionMode           string
 	shutdownTimeout         time.Duration
 	leaderElectionNamespace string
 	leaderElectionID        string
@@ -71,6 +72,9 @@ func init() {
 		"Path to kubeconfig file (optional, uses in-cluster config if not specified)")
 	rootCmd.Flags().StringVar(&driverName, "driver-name", "nodepartition.dra.k8s.io",
 		"Coordinator identifier for DeviceClass labels and opaque config")
+	rootCmd.Flags().StringVar(&partitionMode, "partition-mode", "auto",
+		`Partition strategy: "auto" (groupings if ConfigMaps exist, else fixed partitions), `+
+			`"partitions" (always fixed hierarchy), or "groupings" (always admin-defined groupings)`)
 	rootCmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout",
 		defaultShutdownTimeoutSec*time.Second, "Maximum time to wait for graceful shutdown")
 	rootCmd.Flags().StringVar(&leaderElectionNamespace, "leader-election-namespace", "kube-system",
@@ -101,6 +105,10 @@ func runController(_ *cobra.Command, _ []string) error {
 
 	klog.Info("Starting Node Partition Topology Coordinator")
 
+	if !controller.ValidPartitionMode(partitionMode) {
+		return fmt.Errorf("invalid --partition-mode %q: must be auto, partitions, or groupings", partitionMode)
+	}
+
 	// Start health checker regardless of leader status
 	const healthCheckPort = 8081
 	healthChecker := health.NewChecker(healthCheckPort, "1.0.0")
@@ -112,7 +120,7 @@ func runController(_ *cobra.Command, _ []string) error {
 	}
 	klog.Infof("Health check server started on port %d", healthCheckPort)
 
-	ctrl := controller.NewController(clientset, driverName)
+	ctrl := controller.NewController(clientset, driverName, controller.PartitionMode(partitionMode))
 
 	// Start webhook server (runs on all replicas, not just the leader)
 	webhookServer, err := startWebhookServer(ctx, clientset, ctrl.Model())
