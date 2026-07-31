@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
+	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -103,6 +104,21 @@ func (ce *ClaimExpander) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleAdmission processes a single admission request and returns the response.
 func (ce *ClaimExpander) handleAdmission(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	// Route by resource type
+	if req.Resource.Group == "" && req.Resource.Resource == "pods" {
+		if req.Operation == admissionv1.Create {
+			return ce.handlePodAdmission(ctx, req)
+		}
+		return allowResponse()
+	}
+
+	if req.Resource.Group == "kubevirt.io" && req.Resource.Resource == "virtualmachineinstances" {
+		if req.Operation == admissionv1.Create {
+			return ce.handleVMIAdmission(ctx, req)
+		}
+		return allowResponse()
+	}
+
 	// Only handle ResourceClaims
 	if req.Resource.Group != "resource.k8s.io" || req.Resource.Resource != "resourceclaims" {
 		return allowResponse()
@@ -154,6 +170,7 @@ func (ce *ClaimExpander) expandClaim(ctx context.Context, claim *resourcev1.Reso
 	var expandedRequests []resourcev1.DeviceRequest
 	var constraints []resourcev1.DeviceConstraint
 	anyExpanded := false
+	expansionMap := make(map[string][]string) // original request name → expanded request names
 
 	for _, req := range requests {
 		if req.Exactly == nil {
@@ -178,6 +195,13 @@ func (ce *ClaimExpander) expandClaim(ctx context.Context, claim *resourcev1.Reso
 		expandedRequests = append(expandedRequests, subRequests...)
 		constraints = append(constraints, subConstraints...)
 		anyExpanded = true
+
+		// Track the expansion mapping for Pod rewriting
+		var expandedNames []string
+		for _, sr := range subRequests {
+			expandedNames = append(expandedNames, sr.Name)
+		}
+		expansionMap[req.Name] = expandedNames
 	}
 
 	if !anyExpanded {
@@ -202,7 +226,9 @@ func (ce *ClaimExpander) expandClaim(ctx context.Context, claim *resourcev1.Reso
 				Value: constraints,
 			})
 		} else {
-			merged := append(claim.Spec.Devices.Constraints, constraints...)
+			merged := make([]resourcev1.DeviceConstraint, 0, len(claim.Spec.Devices.Constraints)+len(constraints))
+			merged = append(merged, claim.Spec.Devices.Constraints...)
+			merged = append(merged, constraints...)
 			patches = append(patches, jsonPatch{
 				Op:    "replace",
 				Path:  "/spec/devices/constraints",
@@ -211,65 +237,170 @@ func (ce *ClaimExpander) expandClaim(ctx context.Context, claim *resourcev1.Reso
 		}
 	}
 
+	// Inject VFIO opaque configs for passthrough drivers that don't already
+	// have a config. This tells DRA drivers to bind devices to vfio-pci
+	// during Prepare — needed for KubeVirt VM passthrough.
+	existingConfigDrivers := make(map[string]bool)
+	for _, cfg := range claim.Spec.Devices.Config {
+		if cfg.Opaque != nil {
+			existingConfigDrivers[cfg.Opaque.Driver] = true
+		}
+	}
+	var vfioConfigs []resourcev1.DeviceClaimConfiguration
+	for _, sr := range expandedRequests {
+		if sr.Exactly == nil {
+			continue
+		}
+		driver := sr.Exactly.DeviceClassName
+		if existingConfigDrivers[driver] {
+			continue
+		}
+		vfioConfig := ce.buildVfioConfig(driver)
+		if vfioConfig != nil {
+			vfioConfigs = append(vfioConfigs, *vfioConfig)
+			existingConfigDrivers[driver] = true
+		}
+	}
+	if len(vfioConfigs) > 0 {
+		allConfigs := append(claim.Spec.Devices.Config, vfioConfigs...)
+		if len(claim.Spec.Devices.Config) == 0 {
+			patches = append(patches, jsonPatch{
+				Op:    "add",
+				Path:  "/spec/devices/config",
+				Value: allConfigs,
+			})
+		} else {
+			patches = append(patches, jsonPatch{
+				Op:    "replace",
+				Path:  "/spec/devices/config",
+				Value: allConfigs,
+			})
+		}
+	}
+
+	// Annotate the claim with the expansion mapping so the Pod webhook
+	// can rewrite container request references without re-fetching DeviceClasses.
+	if len(expansionMap) > 0 {
+		mapJSON, err := json.Marshal(expansionMap)
+		if err != nil {
+			klog.Warningf("Failed to marshal expansion map: %v", err)
+		} else {
+			annotations := claim.Annotations
+			if annotations == nil {
+				annotations = make(map[string]string)
+			}
+			annotations[driverName+"/expanded-requests"] = string(mapJSON)
+			if claim.Annotations == nil {
+				patches = append(patches, jsonPatch{
+					Op:    "add",
+					Path:  "/metadata/annotations",
+					Value: annotations,
+				})
+			} else {
+				patches = append(patches, jsonPatch{
+					Op:    "add",
+					Path:  "/metadata/annotations/" + escapeJSONPointer(driverName+"/expanded-requests"),
+					Value: string(mapJSON),
+				})
+			}
+		}
+	}
+
 	return patches, nil
 }
 
-// expandRequest expands a single partition DeviceRequest into sub-resource requests
-// and alignment constraints based on the PartitionConfig.
+// expandRequest expands a partition DeviceRequest into sub-resource requests.
+// When req.Exactly.Count > 1, creates N independent partition instances, each
+// with its own set of sub-requests and alignment constraints.
 func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *controller.PartitionConfig) ([]resourcev1.DeviceRequest, []resourcev1.DeviceConstraint) {
+	count := int64(1)
+	if req.Exactly != nil && req.Exactly.Count > 1 {
+		count = req.Exactly.Count
+	}
+
+	var allSubRequests []resourcev1.DeviceRequest
+	var allConstraints []resourcev1.DeviceConstraint
+
+	for i := int64(0); i < count; i++ {
+		prefix := req.Name
+		if count > 1 {
+			prefix = fmt.Sprintf("%s-%d", req.Name, i)
+		}
+		subRequests, constraints := ce.expandSinglePartition(prefix, req, config)
+		allSubRequests = append(allSubRequests, subRequests...)
+		allConstraints = append(allConstraints, constraints...)
+	}
+
+	return allSubRequests, allConstraints
+}
+
+// expandSinglePartition expands one partition instance into sub-resource requests
+// and alignment constraints. The prefix determines the naming of generated requests.
+//
+// Passthrough device types (GPU, NIC) with count>1 are split into individual
+// count=1 requests so each gets a unique name. This enables KubeVirt to create
+// one hostDevice per physical device. Non-passthrough devices (CPU, memory)
+// keep their original count since they use consumable capacity, not PCI passthrough.
+// The alignment constraints tie all split requests together so the scheduler
+// places them on the same NUMA/pcieRoot.
+func (ce *ClaimExpander) expandSinglePartition(prefix string, req resourcev1.DeviceRequest, config *controller.PartitionConfig) ([]resourcev1.DeviceRequest, []resourcev1.DeviceConstraint) {
 	var subRequests []resourcev1.DeviceRequest
 	var constraints []resourcev1.DeviceConstraint
 
-	// Build a map of generated request names for constraint resolution
-	requestNameMap := make(map[string]string) // subresource device class -> generated request name
+	requestNameMap := make(map[string][]string)
 
 	for _, sr := range config.SubResources {
 		sanitized := sanitizeDeviceClassName(sr.DeviceClass)
-		name := req.Name + "-" + sanitized
-		requestNameMap[sr.DeviceClass] = name
 
-		count := int64(sr.Count)
-		exact := &resourcev1.ExactDeviceRequest{
-			DeviceClassName: sr.DeviceClass,
-			Count:           count,
-		}
+		splitCount := 1
+		deviceCount := sr.Count
 
-		// Add capacity requests for shared devices (DRAConsumableCapacity)
-		if len(sr.Capacity) > 0 {
-			exact.Capacity = &resourcev1.CapacityRequirements{
-				Requests: make(map[resourcev1.QualifiedName]resource.Quantity),
+		for si := 0; si < splitCount; si++ {
+			var name string
+			if splitCount > 1 {
+				name = fmt.Sprintf("%s-%s-%d", prefix, sanitized, si)
+			} else {
+				name = prefix + "-" + sanitized
 			}
-			for capName, capVal := range sr.Capacity {
-				qty, err := resource.ParseQuantity(capVal)
-				if err == nil {
-					exact.Capacity.Requests[resourcev1.QualifiedName(capName)] = qty
+			requestNameMap[sr.DeviceClass] = append(requestNameMap[sr.DeviceClass], name)
+
+			exact := &resourcev1.ExactDeviceRequest{
+				DeviceClassName: sr.DeviceClass,
+				Count:           int64(deviceCount),
+			}
+
+			// Add capacity requests for shared devices (DRAConsumableCapacity)
+			if len(sr.Capacity) > 0 {
+				exact.Capacity = &resourcev1.CapacityRequirements{
+					Requests: make(map[resourcev1.QualifiedName]resource.Quantity),
+				}
+				for capName, capVal := range sr.Capacity {
+					qty, err := resource.ParseQuantity(capVal)
+					if err == nil {
+						exact.Capacity.Requests[resourcev1.QualifiedName(capName)] = qty
+					}
 				}
 			}
-		}
 
-		// Apply per-driver CEL selectors from the PartitionConfig.
-		// These pin each sub-request to the correct NUMA node using the
-		// driver's own attribute namespace (e.g., gpu.amd.com/numaNode),
-		// eliminating the need for a common cross-driver attribute name.
-		for _, cel := range sr.Selectors {
-			exact.Selectors = append(exact.Selectors, resourcev1.DeviceSelector{
-				CEL: &resourcev1.CELDeviceSelector{
-					Expression: cel,
-				},
+			// Apply per-driver CEL selectors from the PartitionConfig.
+			for _, cel := range sr.Selectors {
+				exact.Selectors = append(exact.Selectors, resourcev1.DeviceSelector{
+					CEL: &resourcev1.CELDeviceSelector{
+						Expression: cel,
+					},
+				})
+			}
+
+			// Forward any user-specified selectors from the original partition request
+			if req.Exactly != nil && len(req.Exactly.Selectors) > 0 {
+				exact.Selectors = append(exact.Selectors, req.Exactly.Selectors...)
+			}
+
+			subRequests = append(subRequests, resourcev1.DeviceRequest{
+				Name:    name,
+				Exactly: exact,
 			})
 		}
-
-		// Forward any user-specified selectors from the original partition request
-		// to each expanded sub-request. This enables NUMA pinning (e.g.,
-		// numaNode==0) and other user-specified device filtering.
-		if req.Exactly != nil && len(req.Exactly.Selectors) > 0 {
-			exact.Selectors = append(exact.Selectors, req.Exactly.Selectors...)
-		}
-
-		subRequests = append(subRequests, resourcev1.DeviceRequest{
-			Name:    name,
-			Exactly: exact,
-		})
 	}
 
 	// Build driver counts map for satisfiability checks
@@ -278,9 +409,19 @@ func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *con
 		driverCounts[sr.DeviceClass] = sr.Count
 	}
 
-	// Build constraints from alignments
+	// Build constraints from alignments.
+	// When sub-resources are split (count>1 → individual requests), constraints
+	// need special handling:
+	//
+	// For pcieRoot-type constraints (device-level pairing): create per-index
+	// constraints that pair corresponding devices (gpu-0+nic-0, gpu-1+nic-1).
+	// Each pair must share the same pcieRoot, but different pairs can be on
+	// different roots.
+	//
+	// For numaNode-type constraints (partition-level grouping): create one
+	// global constraint covering all requests. All devices in the partition
+	// must share the same NUMA node.
 	for _, alignment := range config.Alignments {
-		// Skip preferred constraints that cannot be satisfied
 		if alignment.Enforcement == controller.EnforcementPreferred {
 			if ce.model == nil || !ce.model.IsConstraintSatisfiable(alignment.Attribute, driverCounts) {
 				klog.V(2).Infof("Skipping preferred constraint %s: not satisfiable (or no topology model)", alignment.Attribute)
@@ -288,41 +429,86 @@ func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *con
 			}
 		}
 
-		var resolvedRequests []string
+		// Collect resolved request names per driver, preserving order
+		type driverRequests struct {
+			driver string
+			names  []string
+		}
+		var perDriver []driverRequests
 		for _, reqName := range alignment.Requests {
-			// Try to resolve the request name through the mapping
 			if mapped, ok := requestNameMap[reqName]; ok {
-				resolvedRequests = append(resolvedRequests, mapped)
+				perDriver = append(perDriver, driverRequests{reqName, mapped})
 			} else {
-				// Use as-is (might be a reference like "partition" or a direct name)
-				// Try prefixing with the original request name
 				found := false
 				for _, sr := range config.SubResources {
 					sanitized := sanitizeDeviceClassName(sr.DeviceClass)
 					if reqName == sanitized {
-						resolvedRequests = append(resolvedRequests, req.Name+"-"+sanitized)
+						perDriver = append(perDriver, driverRequests{reqName, []string{prefix + "-" + sanitized}})
 						found = true
 						break
 					}
 				}
 				if !found {
-					// Skip references to the original request name (e.g., "partition")
-					// since it no longer exists after expansion
 					continue
 				}
 			}
 		}
 
-		if len(resolvedRequests) < 2 {
-			// A match constraint needs at least 2 requests to be meaningful
-			continue
+		// Check if any driver has split requests (more than 1 name)
+		maxSplit := 0
+		for _, dr := range perDriver {
+			if len(dr.names) > maxSplit {
+				maxSplit = len(dr.names)
+			}
 		}
 
 		attr := resourcev1.FullyQualifiedName(alignment.Attribute)
-		constraints = append(constraints, resourcev1.DeviceConstraint{
-			Requests:       resolvedRequests,
-			MatchAttribute: &attr,
-		})
+
+		if maxSplit <= 1 {
+			// No splits — single constraint covering all requests
+			var allRequests []string
+			for _, dr := range perDriver {
+				allRequests = append(allRequests, dr.names...)
+			}
+			if len(allRequests) >= 2 {
+				constraints = append(constraints, resourcev1.DeviceConstraint{
+					Requests:       allRequests,
+					MatchAttribute: &attr,
+				})
+			}
+		} else if strings.Contains(string(attr), "numaNode") {
+			// NUMA constraint: global — all devices must share the same NUMA
+			var allRequests []string
+			for _, dr := range perDriver {
+				allRequests = append(allRequests, dr.names...)
+			}
+			if len(allRequests) >= 2 {
+				constraints = append(constraints, resourcev1.DeviceConstraint{
+					Requests:       allRequests,
+					MatchAttribute: &attr,
+				})
+			}
+		} else {
+			// Per-pair constraints (pcieRoot, etc.): pair by index.
+			// gpu-0+nic-0 on same root, gpu-1+nic-1 on same root, etc.
+			for idx := 0; idx < maxSplit; idx++ {
+				var pairRequests []string
+				for _, dr := range perDriver {
+					if idx < len(dr.names) {
+						pairRequests = append(pairRequests, dr.names[idx])
+					} else if len(dr.names) == 1 {
+						// Non-split driver (e.g., CPU) — include in every pair
+						pairRequests = append(pairRequests, dr.names[0])
+					}
+				}
+				if len(pairRequests) >= 2 {
+					constraints = append(constraints, resourcev1.DeviceConstraint{
+						Requests:       pairRequests,
+						MatchAttribute: &attr,
+					})
+				}
+			}
+		}
 	}
 
 	return subRequests, constraints
@@ -383,6 +569,455 @@ func sanitizeDeviceClassName(name string) string {
 	}
 
 	return sanitized
+}
+
+// handlePodAdmission rewrites container resource claim request names to match
+// expanded partition request names. This makes partition expansion transparent
+// to consumers like KubeVirt that read KEP-5304 metadata by request name.
+func (ce *ClaimExpander) handlePodAdmission(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	var pod corev1.Pod
+	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
+		klog.Errorf("Failed to unmarshal Pod: %v", err)
+		return allowResponse()
+	}
+
+	// Build a map of pod claim name → expansion mapping by looking up referenced claims
+	type claimExpansion struct {
+		mapping map[string][]string // original request → expanded requests
+	}
+	claimExpansions := make(map[string]*claimExpansion) // pod claim name → expansion
+
+	for _, prc := range pod.Spec.ResourceClaims {
+		// Resolve the claim name — direct reference or template-generated.
+		// Template-generated claims use a naming convention: <pod-name>-<template-name>.
+		// During CREATE admission the pod may not have a name yet (generateName),
+		// so we try direct lookup first.
+		var claimToLookup string
+		if prc.ResourceClaimName != nil && *prc.ResourceClaimName != "" {
+			claimToLookup = *prc.ResourceClaimName
+		} else if prc.ResourceClaimTemplateName != nil && *prc.ResourceClaimTemplateName != "" {
+			// For template claims, the ResourceClaim is created by the scheduler
+			// with name <pod-name>-<claim-name>. Try looking up the template claim.
+			claimToLookup = *prc.ResourceClaimTemplateName
+		}
+		if claimToLookup == "" {
+			continue
+		}
+
+		claim, err := ce.client.ResourceV1().ResourceClaims(req.Namespace).Get(ctx, claimToLookup, metav1.GetOptions{})
+		if err != nil {
+			klog.V(4).Infof("Could not look up claim %s/%s for pod rewriting: %v", req.Namespace, claimToLookup, err)
+			continue
+		}
+
+		annotation := claim.Annotations[driverName+"/expanded-requests"]
+		if annotation == "" {
+			continue
+		}
+
+		var mapping map[string][]string
+		if err := json.Unmarshal([]byte(annotation), &mapping); err != nil {
+			klog.Warningf("Failed to parse expansion annotation on claim %s: %v", claimToLookup, err)
+			continue
+		}
+
+		claimExpansions[prc.Name] = &claimExpansion{mapping: mapping}
+	}
+
+	if len(claimExpansions) == 0 {
+		return allowResponse()
+	}
+
+	var patches []jsonPatch
+
+	// Rewrite container claim references
+	rewriteContainerClaims := func(containerPath string, containers []corev1.Container) {
+		for i, ctr := range containers {
+			var newClaims []corev1.ResourceClaim
+			changed := false
+			for _, rc := range ctr.Resources.Claims {
+				exp, ok := claimExpansions[rc.Name]
+				if !ok || rc.Request == "" {
+					newClaims = append(newClaims, rc)
+					continue
+				}
+				expandedNames, ok := exp.mapping[rc.Request]
+				if !ok {
+					newClaims = append(newClaims, rc)
+					continue
+				}
+				// Expand into N entries, one per sub-request
+				for _, expandedName := range expandedNames {
+					newClaims = append(newClaims, corev1.ResourceClaim{
+						Name:    rc.Name,
+						Request: expandedName,
+					})
+				}
+				changed = true
+			}
+			if changed {
+				patches = append(patches, jsonPatch{
+					Op:    "replace",
+					Path:  fmt.Sprintf("%s/%d/resources/claims", containerPath, i),
+					Value: newClaims,
+				})
+			}
+		}
+	}
+
+	rewriteContainerClaims("/spec/containers", pod.Spec.Containers)
+	rewriteContainerClaims("/spec/initContainers", pod.Spec.InitContainers)
+
+	if len(patches) == 0 {
+		return allowResponse()
+	}
+
+	podID := pod.Name
+	if podID == "" {
+		podID = pod.GenerateName + "*"
+	}
+	klog.Infof("Rewriting %d container claim references in pod %s/%s", len(patches), req.Namespace, podID)
+
+	patchBytes, err := json.Marshal(patches)
+	if err != nil {
+		klog.Errorf("Failed to marshal pod patches: %v", err)
+		return allowResponse()
+	}
+
+	patchType := admissionv1.PatchTypeJSONPatch
+	return &admissionv1.AdmissionResponse{
+		Allowed:   true,
+		PatchType: &patchType,
+		Patch:     patchBytes,
+	}
+}
+
+// handleVMIAdmission auto-generates hostDevices for KubeVirt VMIs that
+// reference partition ResourceClaimTemplates, and rewrites requestName fields
+// on any existing hostDevices/gpus to match expanded partition request names.
+func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	var vmi map[string]interface{}
+	if err := json.Unmarshal(req.Object.Raw, &vmi); err != nil {
+		klog.Errorf("Failed to unmarshal VMI: %v", err)
+		return allowResponse()
+	}
+
+	var patches []jsonPatch
+
+	resourceClaims := nestedSlice(vmi, "spec", "resourceClaims")
+	existingHostDevices := nestedSlice(vmi, "spec", "domain", "devices", "hostDevices")
+	hdIdx := len(existingHostDevices)
+	globalDevIdx := 0
+
+	// For each resourceClaim referencing a template, look up the template's
+	// DeviceClass config and auto-generate hostDevices if none exist for it.
+	for _, rc := range resourceClaims {
+		rcMap, ok := rc.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		rcName, _ := rcMap["name"].(string)
+		templateName, _ := rcMap["resourceClaimTemplateName"].(string)
+		if templateName == "" {
+			continue
+		}
+
+		// Check if the VMI already has hostDevices for this claim
+		hasDevices := false
+		for _, hd := range existingHostDevices {
+			hdMap, _ := hd.(map[string]interface{})
+			if hdMap["claimName"] == rcName {
+				hasDevices = true
+				break
+			}
+		}
+		if hasDevices {
+			continue
+		}
+
+		// Look up the ResourceClaimTemplate
+		tpl, err := ce.client.ResourceV1().ResourceClaimTemplates(req.Namespace).Get(ctx, templateName, metav1.GetOptions{})
+		if err != nil {
+			klog.Warningf("VMI webhook: failed to get ResourceClaimTemplate %s: %v", templateName, err)
+			continue
+		}
+		// Find the partition request and its DeviceClass
+		for _, tplReq := range tpl.Spec.Spec.Devices.Requests {
+			if tplReq.Exactly == nil || tplReq.Exactly.DeviceClassName == "" {
+				continue
+			}
+
+			config, err := ce.getPartitionConfig(ctx, tplReq.Exactly.DeviceClassName)
+			if err != nil || config == nil {
+				continue
+			}
+
+			count := int64(1)
+			if tplReq.Exactly.Count > 1 {
+				count = tplReq.Exactly.Count
+			}
+
+			// Identify passthrough device classes (GPU, NIC — not CPU/memory).
+			var passthroughDevices []struct {
+				class    string
+				nameHint string
+				srCount  int
+			}
+			for _, sr := range config.SubResources {
+				lc := strings.ToLower(sr.DeviceClass)
+				hint := ""
+				if strings.Contains(lc, "gpu") || strings.Contains(lc, "nvidia") {
+					hint = "gpu"
+				} else if strings.Contains(lc, "net") || strings.Contains(lc, "sriov") || strings.Contains(lc, "rdma") {
+					hint = "nic"
+				}
+				if hint != "" {
+					passthroughDevices = append(passthroughDevices, struct {
+						class    string
+						nameHint string
+						srCount  int
+					}{sr.DeviceClass, hint, sr.Count})
+				}
+			}
+
+			if len(passthroughDevices) == 0 {
+				continue
+			}
+
+			// Generate hostDevices for each partition instance
+			for i := int64(0); i < count; i++ {
+				for _, pd := range passthroughDevices {
+					for si := 0; si < pd.srCount; si++ {
+						// Build the expanded request name matching the split
+						// pattern from claim expansion
+						var requestName string
+						sanitized := sanitizeForRequestName(pd.class)
+						prefix := tplReq.Name
+						if count > 1 {
+							prefix = fmt.Sprintf("%s-%d", tplReq.Name, i)
+						}
+						requestName = fmt.Sprintf("%s-%s", prefix, sanitized)
+
+						deviceName := fmt.Sprintf("%s%d", pd.nameHint, globalDevIdx)
+						globalDevIdx++
+
+						hostDevice := map[string]interface{}{
+							"name":        deviceName,
+							"claimName":   rcName,
+							"requestName": requestName,
+						}
+
+						if hdIdx == 0 && len(existingHostDevices) == 0 {
+							patches = append(patches, jsonPatch{
+								Op:    "add",
+								Path:  "/spec/domain/devices/hostDevices",
+								Value: []interface{}{hostDevice},
+							})
+							hdIdx++
+						} else {
+							patches = append(patches, jsonPatch{
+								Op:    "add",
+								Path:  "/spec/domain/devices/hostDevices/-",
+								Value: hostDevice,
+							})
+							hdIdx++
+						}
+					}
+				}
+			}
+
+			vmiName, _ := vmi["metadata"].(map[string]interface{})["name"].(string)
+			klog.Infof("Auto-generated %d hostDevices for VMI %s/%s from template %s (count=%d)",
+				int(count)*len(passthroughDevices), req.Namespace, vmiName, templateName, count)
+		}
+	}
+
+	// Also handle existing hostDevices/gpus that need requestName rewriting
+	// (for manually specified devices referencing pre-expansion names)
+	expansionMap := make(map[string]map[string][]string)
+	for _, rc := range resourceClaims {
+		rcMap, ok := rc.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		claimName, _ := rcMap["resourceClaimName"].(string)
+		if claimName == "" {
+			continue
+		}
+		claim, err := ce.client.ResourceV1().ResourceClaims(req.Namespace).Get(ctx, claimName, metav1.GetOptions{})
+		if err != nil {
+			continue
+		}
+		annotation := claim.Annotations[driverName+"/expanded-requests"]
+		if annotation == "" {
+			continue
+		}
+		var mapping map[string][]string
+		if err := json.Unmarshal([]byte(annotation), &mapping); err != nil {
+			continue
+		}
+		rcName, _ := rcMap["name"].(string)
+		expansionMap[rcName] = mapping
+	}
+
+	if len(expansionMap) > 0 {
+		gpus := nestedSlice(vmi, "spec", "domain", "devices", "gpus")
+		for i, g := range gpus {
+			gMap, ok := g.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			claimName, _ := gMap["claimName"].(string)
+			requestName, _ := gMap["requestName"].(string)
+			if claimName == "" || requestName == "" {
+				continue
+			}
+			mapping, ok := expansionMap[claimName]
+			if !ok {
+				continue
+			}
+			expanded, ok := mapping[requestName]
+			if !ok || len(expanded) == 0 {
+				continue
+			}
+			for _, name := range expanded {
+				if strings.Contains(name, "gpu") {
+					patches = append(patches, jsonPatch{
+						Op:    "replace",
+						Path:  fmt.Sprintf("/spec/domain/devices/gpus/%d/requestName", i),
+						Value: name,
+					})
+					break
+				}
+			}
+		}
+
+		hostDevices := nestedSlice(vmi, "spec", "domain", "devices", "hostDevices")
+		for i, hd := range hostDevices {
+			hdMap, ok := hd.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			claimName, _ := hdMap["claimName"].(string)
+			requestName, _ := hdMap["requestName"].(string)
+			if claimName == "" || requestName == "" {
+				continue
+			}
+			mapping, ok := expansionMap[claimName]
+			if !ok {
+				continue
+			}
+			expanded, ok := mapping[requestName]
+			if !ok || len(expanded) == 0 {
+				continue
+			}
+			deviceName, _ := hdMap["name"].(string)
+			matched := false
+			for _, name := range expanded {
+				if (strings.Contains(name, "net") || strings.Contains(name, "sriov")) && strings.Contains(deviceName, "nic") {
+					patches = append(patches, jsonPatch{Op: "replace", Path: fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i), Value: name})
+					matched = true
+					break
+				}
+				if strings.Contains(name, "nvme") && strings.Contains(deviceName, "nvme") {
+					patches = append(patches, jsonPatch{Op: "replace", Path: fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i), Value: name})
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				for _, name := range expanded {
+					if !strings.Contains(name, "gpu") {
+						patches = append(patches, jsonPatch{Op: "replace", Path: fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i), Value: name})
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if len(patches) == 0 {
+		return allowResponse()
+	}
+
+	vmiName, _ := vmi["metadata"].(map[string]interface{})["name"].(string)
+	klog.Infof("Patching %d fields in VMI %s/%s", len(patches), req.Namespace, vmiName)
+
+	patchBytes, err := json.Marshal(patches)
+	if err != nil {
+		klog.Errorf("Failed to marshal VMI patches: %v", err)
+		return allowResponse()
+	}
+
+	patchType := admissionv1.PatchTypeJSONPatch
+	return &admissionv1.AdmissionResponse{
+		Allowed:   true,
+		PatchType: &patchType,
+		Patch:     patchBytes,
+	}
+}
+
+func sanitizeForRequestName(s string) string {
+	return strings.NewReplacer(
+		"/", "-",
+		".", "-",
+	).Replace(strings.ToLower(s))
+}
+
+// nestedSlice extracts a nested []interface{} from a map hierarchy.
+func nestedSlice(obj map[string]interface{}, fields ...string) []interface{} {
+	current := obj
+	for i, field := range fields {
+		if i == len(fields)-1 {
+			val, _ := current[field].([]interface{})
+			return val
+		}
+		next, ok := current[field].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		current = next
+	}
+	return nil
+}
+
+// escapeJSONPointer escapes special characters in JSON Pointer tokens (RFC 6901).
+func escapeJSONPointer(s string) string {
+	s = strings.ReplaceAll(s, "~", "~0")
+	s = strings.ReplaceAll(s, "/", "~1")
+	return s
+}
+
+// buildVfioConfig returns the driver-specific opaque config that tells a DRA
+// driver to bind a device to vfio-pci during Prepare. Returns nil for unknown
+// drivers. The VMI webhook uses this to inject VFIO configs into claim templates
+// so users don't need to know driver-specific config formats.
+func (ce *ClaimExpander) buildVfioConfig(driver string) *resourcev1.DeviceClaimConfiguration {
+	lc := strings.ToLower(driver)
+
+	if strings.Contains(lc, "sriov") || strings.Contains(lc, "net") || strings.Contains(lc, "rdma") {
+		return &resourcev1.DeviceClaimConfiguration{
+			DeviceConfiguration: resourcev1.DeviceConfiguration{
+				Opaque: &resourcev1.OpaqueDeviceConfiguration{
+					Driver:     driver,
+					Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"sriovnetwork.k8snetworkplumbingwg.io/v1alpha1","kind":"VfConfig","driver":"vfio-pci"}`)},
+				},
+			},
+		}
+	}
+
+	if strings.Contains(lc, "gpu") && (strings.Contains(lc, "amd") || strings.Contains(lc, "1002")) {
+		return &resourcev1.DeviceClaimConfiguration{
+			DeviceConfiguration: resourcev1.DeviceConfiguration{
+				Opaque: &resourcev1.OpaqueDeviceConfiguration{
+					Driver:     driver,
+					Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"gpu.resource.amd.com/v1alpha1","kind":"VfioDeviceConfig"}`)},
+				},
+			},
+		}
+	}
+
+	return nil
 }
 
 // allowResponse returns an admission response that allows the request without mutation.
