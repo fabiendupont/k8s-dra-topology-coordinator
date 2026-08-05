@@ -577,6 +577,9 @@ func baseDriverName(driverName string) string {
 // divideQuantity divides a Kubernetes quantity string by a divisor.
 // Returns the divided quantity as a string, or empty string on failure.
 func divideQuantity(qty string, divisor int) string {
+	if divisor <= 0 {
+		return ""
+	}
 	q, err := resource.ParseQuantity(qty)
 	if err != nil {
 		klog.V(4).Infof("Failed to parse quantity %q: %v", qty, err)

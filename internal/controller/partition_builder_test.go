@@ -465,6 +465,114 @@ func TestPartitionBuilder_PartitionableDevicesEighths(t *testing.T) {
 	}
 }
 
+func TestDivideQuantity(t *testing.T) {
+	tests := []struct {
+		name    string
+		qty     string
+		divisor int
+		want    string
+	}{
+		{"normal", "64", 4, "16"},
+		{"one", "32", 1, "32"},
+		{"zero divisor", "64", 0, ""},
+		{"unparseable", "notanumber", 4, ""},
+		{"remainder truncated", "10", 3, "3"},
+		{"result zero", "1", 4, ""},
+		{"memory quantity", "8Gi", 4, "2Gi"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := divideQuantity(tt.qty, tt.divisor)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestDetectPCIeRootPairings_MultiDriver(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+	builder := NewPartitionBuilder(model, rules)
+
+	gpuDevices := []resourcev1.Device{makeGPUDevice("gpu-0", 0, "pcie-0")}
+	model.UpdateFromResourceSlice(makeResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", gpuDevices))
+
+	nicDevices := []resourcev1.Device{makeNICDevice("nic-0", 0, "pcie-0")}
+	model.UpdateFromResourceSlice(makeResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", nicDevices))
+
+	groupings := builder.DetectPCIeRootPairings()
+	assert.Len(t, groupings, 1)
+	assert.Equal(t, "pcieRoot", groupings[0].Alignment)
+	assert.Equal(t, "numaNode", groupings[0].Fallback)
+	assert.Len(t, groupings[0].Devices, 2)
+}
+
+func TestDetectPCIeRootPairings_SingleDriver(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+	builder := NewPartitionBuilder(model, rules)
+
+	gpuDevices := []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+		makeGPUDevice("gpu-1", 0, "pcie-1"),
+	}
+	model.UpdateFromResourceSlice(makeResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", gpuDevices))
+
+	groupings := builder.DetectPCIeRootPairings()
+	assert.Empty(t, groupings)
+}
+
+func TestDetectPCIeRootPairings_ExcludesCapacityOnly(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+	builder := NewPartitionBuilder(model, rules)
+
+	gpuDevices := []resourcev1.Device{makeGPUDevice("gpu-0", 0, "pcie-0")}
+	model.UpdateFromResourceSlice(makeResourceSlice("gpu", "gpu.nvidia.com", "node-1", "gpu-pool", gpuDevices))
+
+	cpuDevices := []resourcev1.Device{
+		{
+			Name: "cpu-0",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+			},
+			Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+				"dra.cpu/cpu": {Value: resource.MustParse("32")},
+			},
+		},
+	}
+	model.UpdateFromResourceSlice(makeResourceSlice("cpu", "dra.cpu", "node-1", "cpu-pool", cpuDevices))
+
+	groupings := builder.DetectPCIeRootPairings()
+	assert.Empty(t, groupings, "capacity-only driver without pcieRoot should not produce pairings")
+}
+
+func TestDetectPCIeRootPairings_ThreeDrivers(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+	builder := NewPartitionBuilder(model, rules)
+
+	for _, d := range []struct{ driver, dev string }{
+		{"gpu.nvidia.com", "gpu-0"},
+		{"rdma.mellanox.com", "nic-0"},
+		{"dra.nvme", "nvme-0"},
+	} {
+		devices := []resourcev1.Device{
+			{
+				Name: d.dev,
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+					resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-0")},
+				},
+			},
+		}
+		model.UpdateFromResourceSlice(makeResourceSlice(d.driver+"-slice", d.driver, "node-1", d.driver+"-pool", devices))
+	}
+
+	groupings := builder.DetectPCIeRootPairings()
+	assert.Len(t, groupings, 3, "three drivers should produce 3 pairwise groupings")
+}
+
 func TestBaseDriverName(t *testing.T) {
 	tests := []struct {
 		input string
