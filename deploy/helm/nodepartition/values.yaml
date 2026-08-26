@@ -5,10 +5,12 @@ commonAnnotations: {}
 
 driverName: "nodepartition.dra.k8s.io"
 
+partitionMode: "auto"
+
 controller:
   replicaCount: 1
   image:
-    repository: ghcr.io/fabiendupont/nodepartition-controller
+    repository: ghcr.io/rh-ecosystem-edge/nodepartition-controller
     pullPolicy: IfNotPresent
     tag: ""
   imagePullSecrets: []
