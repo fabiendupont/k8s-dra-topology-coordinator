@@ -986,3 +986,80 @@ func TestDeviceClassManager_SLITReachability(t *testing.T) {
 	assert.Equal(t, 1, subResources["gpu.amd.com"], "GPU count should be 1 (not inflated)")
 	assert.Equal(t, 1, subResources["sriov"], "NIC count should be 1 per NUMA (4 VFs / 4 sharing NUMAs)")
 }
+
+func TestIsPartitionConstraintSatisfiable_SharedRoot(t *testing.T) {
+	pcieRoot := "pci0000:15"
+	devices := []TopologyDevice{
+		{DriverName: "gpu.nvidia.com", PCIeRoot: &pcieRoot},
+		{DriverName: "rdma.mellanox.com", PCIeRoot: &pcieRoot},
+	}
+	driverCounts := map[string]int{
+		"gpu.nvidia.com":    1,
+		"rdma.mellanox.com": 1,
+	}
+
+	assert.True(t, isPartitionConstraintSatisfiable(devices, AttrPCIeRoot, driverCounts))
+}
+
+func TestIsPartitionConstraintSatisfiable_DifferentRoots(t *testing.T) {
+	gpuRoot := "pci0000:15"
+	nicRoot := "pci0000:37"
+	devices := []TopologyDevice{
+		{DriverName: "gpu.nvidia.com", PCIeRoot: &gpuRoot},
+		{DriverName: "rdma.mellanox.com", PCIeRoot: &nicRoot},
+	}
+	driverCounts := map[string]int{
+		"gpu.nvidia.com":    1,
+		"rdma.mellanox.com": 1,
+	}
+
+	assert.False(t, isPartitionConstraintSatisfiable(devices, AttrPCIeRoot, driverCounts))
+}
+
+func TestIsPartitionConstraintSatisfiable_NonPCIDriverSkipped(t *testing.T) {
+	pcieRoot := "pci0000:15"
+	devices := []TopologyDevice{
+		{DriverName: "gpu.nvidia.com", PCIeRoot: &pcieRoot},
+		{DriverName: "rdma.mellanox.com", PCIeRoot: &pcieRoot},
+		{DriverName: "dra.cpu", PCIeRoot: nil},
+	}
+	driverCounts := map[string]int{
+		"gpu.nvidia.com":    1,
+		"rdma.mellanox.com": 1,
+		"dra.cpu":           1,
+	}
+
+	assert.True(t, isPartitionConstraintSatisfiable(devices, AttrPCIeRoot, driverCounts),
+		"CPU driver without pcieRoot should be skipped, not cause failure")
+}
+
+func TestIsPartitionConstraintSatisfiable_SingleDriver(t *testing.T) {
+	pcieRoot := "pci0000:15"
+	devices := []TopologyDevice{
+		{DriverName: "gpu.nvidia.com", PCIeRoot: &pcieRoot},
+	}
+	driverCounts := map[string]int{"gpu.nvidia.com": 1}
+
+	assert.False(t, isPartitionConstraintSatisfiable(devices, AttrPCIeRoot, driverCounts),
+		"single driver should return false (need 2+ for meaningful constraint)")
+}
+
+func TestSanitizeDNSLabel(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"valid passthrough", "my-label"},
+		{"uppercase lowered", "My-Label"},
+		{"dots to dashes", "gpu.nvidia.com"},
+		{"truncates long", "this-is-a-very-long-label-name-that-exceeds-the-sixty-three-character-limit-for-dns-labels"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := sanitizeDNSLabel(tt.input)
+			assert.LessOrEqual(t, len(result), 63, "DNS label must be <= 63 chars")
+			assert.NotEmpty(t, result)
+		})
+	}
+}

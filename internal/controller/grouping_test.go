@@ -454,3 +454,115 @@ func TestGroupingBuilder_MultipleInstancesUniqueDevices(t *testing.T) {
 	}
 	assert.Len(t, allDeviceNames, 8, "all 8 devices should be allocated")
 }
+
+func TestSanitizeForName(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"gpu.nvidia.com", "gpu-nvidia-com"},
+		{"resource.kubernetes.io/pcieRoot", "resource-kubernetes-io-pcieroot"},
+		{"simple", "simple"},
+		{"UPPER", "upper"},
+		{"host:port", "host-port"},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			assert.Equal(t, tt.want, sanitizeForName(tt.input))
+		})
+	}
+}
+
+func TestGroupingBuilder_FallbackFromPCIeRootToNUMA(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+
+	// GPU on pcie-0, NIC on pcie-1 — pcieRoot unsatisfiable, but both on NUMA 0
+	nodeTopo := &NodeTopology{
+		NodeName:        "node-1",
+		DevicesByDriver: make(map[string][]TopologyDevice),
+	}
+	nodeTopo.DevicesByDriver["gpu-slice"] = []TopologyDevice{
+		makeTestDevice("gpu.amd.com", "gpu-0", int64Ptr(0), stringPtr("pcie-0")),
+	}
+	nodeTopo.DevicesByDriver["nic-slice"] = []TopologyDevice{
+		makeTestDevice("rdma.mellanox.com", "nic-0", int64Ptr(0), stringPtr("pcie-1")),
+	}
+
+	model.mu.Lock()
+	model.nodes = map[string]*NodeTopology{"node-1": nodeTopo}
+	model.mu.Unlock()
+
+	builder := NewGroupingBuilder(model, rules)
+
+	grouping := DeviceGrouping{
+		Name:      "gpu-nic-pair",
+		Alignment: "pcieRoot",
+		Fallback:  "numaNode",
+		Devices: []GroupingDevice{
+			{Class: "gpu.amd.com", Count: 1},
+			{Class: "rdma.mellanox.com", Count: 1},
+		},
+	}
+
+	results := builder.BuildGroupings([]DeviceGrouping{grouping})
+	require.Len(t, results, 1)
+
+	// pcieRoot should fail (different roots), numaNode fallback should succeed
+	hasNUMAInstance := false
+	for _, inst := range results[0].Instances {
+		if inst.Alignment == "numaNode" {
+			hasNUMAInstance = true
+		}
+	}
+	assert.True(t, hasNUMAInstance, "should have a numaNode fallback instance")
+}
+
+func TestGroupingBuilder_RailIndexDeterministic(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+
+	nodeTopo := &NodeTopology{
+		NodeName:        "node-1",
+		DevicesByDriver: make(map[string][]TopologyDevice),
+	}
+	nodeTopo.DevicesByDriver["gpu-slice"] = []TopologyDevice{
+		makeTestDevice("gpu.amd.com", "gpu-0", int64Ptr(0), stringPtr("pcie-0")),
+		makeTestDevice("gpu.amd.com", "gpu-1", int64Ptr(0), stringPtr("pcie-1")),
+	}
+	nodeTopo.DevicesByDriver["nic-slice"] = []TopologyDevice{
+		makeTestDevice("rdma.mellanox.com", "nic-0", int64Ptr(0), stringPtr("pcie-0")),
+		makeTestDevice("rdma.mellanox.com", "nic-1", int64Ptr(0), stringPtr("pcie-1")),
+	}
+
+	model.mu.Lock()
+	model.nodes = map[string]*NodeTopology{"node-1": nodeTopo}
+	model.mu.Unlock()
+
+	builder := NewGroupingBuilder(model, rules)
+
+	grouping := DeviceGrouping{
+		Name:      "gpu-nic-pair",
+		Alignment: "pcieRoot",
+		Devices: []GroupingDevice{
+			{Class: "gpu.amd.com", Count: 1},
+			{Class: "rdma.mellanox.com", Count: 1},
+		},
+	}
+
+	// Run twice — rail indices should be identical
+	results1 := builder.BuildGroupings([]DeviceGrouping{grouping})
+	results2 := builder.BuildGroupings([]DeviceGrouping{grouping})
+
+	require.Len(t, results1, 1)
+	require.Len(t, results2, 1)
+	require.Len(t, results1[0].Instances, 2)
+	require.Len(t, results2[0].Instances, 2)
+
+	for i := range results1[0].Instances {
+		assert.Equal(t, results1[0].Instances[i].RailIndex, results2[0].Instances[i].RailIndex,
+			"rail index should be deterministic across calls")
+	}
+}

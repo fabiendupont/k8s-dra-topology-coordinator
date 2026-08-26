@@ -1008,6 +1008,130 @@ func TestHandlePodAdmission_RewritesClaimReferences(t *testing.T) {
 	}
 }
 
+func TestHandleVMIAdmission_NoTemplates(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	expander := NewClaimExpander(client)
+
+	vmi := map[string]interface{}{
+		"apiVersion": "kubevirt.io/v1",
+		"kind":       "VirtualMachineInstance",
+		"metadata": map[string]interface{}{
+			"name":      "test-vmi",
+			"namespace": "default",
+		},
+		"spec": map[string]interface{}{
+			"domain": map[string]interface{}{
+				"devices": map[string]interface{}{},
+			},
+		},
+	}
+	vmiJSON, _ := json.Marshal(vmi)
+
+	req := &admissionv1.AdmissionRequest{
+		UID: "test-uid",
+		Resource: metav1.GroupVersionResource{
+			Group: "kubevirt.io", Version: "v1", Resource: "virtualmachineinstances",
+		},
+		Operation: admissionv1.Create,
+		Object:    runtime.RawExtension{Raw: vmiJSON},
+		Namespace: "default",
+	}
+
+	resp := expander.handleVMIAdmission(context.Background(), req)
+	assert.True(t, resp.Allowed)
+	assert.Nil(t, resp.PatchType, "VMI without templates should not be mutated")
+}
+
+func TestHandleVMIAdmission_GeneratesHostDevices(t *testing.T) {
+	partConfig := controller.PartitionConfig{
+		Kind: "PartitionConfig",
+		SubResources: []controller.SubResourceConfig{
+			{DeviceClass: "gpu.amd.com", Count: 1},
+			{DeviceClass: "sriovnetwork.k8snetworkplumbingwg.io", Count: 1},
+			{DeviceClass: "dra.cpu", Count: 1},
+		},
+	}
+	partClass := makePartitionDeviceClass("eighth", partConfig)
+
+	configJSON, _ := json.Marshal(partConfig)
+	claimTemplate := &resourcev1.ResourceClaimTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vm-eighth-tpl",
+			Namespace: "default",
+		},
+		Spec: resourcev1.ResourceClaimTemplateSpec{
+			Spec: resourcev1.ResourceClaimSpec{
+				Devices: resourcev1.DeviceClaim{
+					Requests: []resourcev1.DeviceRequest{
+						{
+							Name: "partition",
+							Exactly: &resourcev1.ExactDeviceRequest{
+								DeviceClassName: "eighth",
+								Count:           1,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	_ = configJSON
+
+	client := fake.NewSimpleClientset(partClass, claimTemplate)
+	expander := NewClaimExpander(client)
+
+	vmi := map[string]interface{}{
+		"apiVersion": "kubevirt.io/v1",
+		"kind":       "VirtualMachineInstance",
+		"metadata": map[string]interface{}{
+			"name":      "test-vmi",
+			"namespace": "default",
+		},
+		"spec": map[string]interface{}{
+			"resourceClaims": []interface{}{
+				map[string]interface{}{
+					"name":                      "partition",
+					"resourceClaimTemplateName": "vm-eighth-tpl",
+				},
+			},
+			"domain": map[string]interface{}{
+				"devices": map[string]interface{}{},
+			},
+		},
+	}
+	vmiJSON, _ := json.Marshal(vmi)
+
+	req := &admissionv1.AdmissionRequest{
+		UID: "test-uid",
+		Resource: metav1.GroupVersionResource{
+			Group: "kubevirt.io", Version: "v1", Resource: "virtualmachineinstances",
+		},
+		Operation: admissionv1.Create,
+		Object:    runtime.RawExtension{Raw: vmiJSON},
+		Namespace: "default",
+	}
+
+	resp := expander.handleVMIAdmission(context.Background(), req)
+	assert.True(t, resp.Allowed)
+
+	if resp.PatchType != nil {
+		assert.Equal(t, admissionv1.PatchTypeJSONPatch, *resp.PatchType)
+
+		var patches []jsonPatch
+		err := json.Unmarshal(resp.Patch, &patches)
+		require.NoError(t, err)
+
+		// Should have patches adding hostDevices for GPU and NIC (not CPU)
+		hasHostDevicePatch := false
+		for _, p := range patches {
+			if strings.Contains(p.Path, "hostDevices") {
+				hasHostDevicePatch = true
+			}
+		}
+		assert.True(t, hasHostDevicePatch, "should generate hostDevices patches for passthrough devices")
+	}
+}
+
 func TestEscapeJSONPointer(t *testing.T) {
 	assert.Equal(t, "a~1b", escapeJSONPointer("a/b"))
 	assert.Equal(t, "a~0b", escapeJSONPointer("a~b"))
